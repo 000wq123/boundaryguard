@@ -74,6 +74,11 @@ suspicious.py:4:14  U+202E RIGHT-TO-LEFT OVERRIDE (RLO) [bidi_format]  render='\
 
 Drop `boundaryguard check --recursive .` into your CI and never merge invisible code again.
 
+### Security behavior
+
+- **Missing paths fail loudly** — `check` on a nonexistent path exits `2`, never a false "clean".
+- **Symlinks are never followed** during tree scans, so a repo can't pull in content from outside its root via a symlinked file or directory.
+
 ---
 
 ## Python API

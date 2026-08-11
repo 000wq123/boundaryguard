@@ -146,3 +146,27 @@ class TestFileScanning:
         found = scan_path(tmp_path, recursive=True)
         assert len(found) == 1
         assert ".git" not in found[0].path
+
+    def test_scan_path_missing_dir_raises_oserror(self, tmp_path: Path):
+        # A mistyped path must fail loudly, not silently report "clean".
+        with pytest.raises(OSError):
+            scan_path(tmp_path / "does-not-exist", recursive=True)
+        with pytest.raises(OSError):
+            scan_path(tmp_path / "does-not-exist", recursive=False)
+
+    def test_scan_path_skips_symlinked_files(self, tmp_path: Path):
+        # A symlink inside the tree must not pull in content from outside.
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        secret = outside / "secret.py"
+        secret.write_text(f"evil = '{RLO}'", encoding="utf-8")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        link = repo / "innocent.py"
+        try:
+            link.symlink_to(secret)
+        except OSError:
+            pytest.skip("symlinks not permitted on this platform")
+        found = scan_path(repo, recursive=True)
+        assert found == []
+        assert not any("secret" in f.path for f in found)

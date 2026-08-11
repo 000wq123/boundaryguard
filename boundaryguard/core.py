@@ -245,9 +245,19 @@ def scan_path(path: Path, policy: str = "security", recursive: bool = False) -> 
 
     When *path* is a directory and *recursive* is True the directory is
     walked (skipping VCS, virtualenv, and cache directories).
+
+    Symlinked files and directories are **never** followed during a tree
+    scan, so a tree can never pull in content from outside its root.
+
+    Raises:
+        OSError: If *path* does not exist or is not readable as a
+            directory (so a mistyped path fails loudly instead of
+            reporting a false "clean").
     """
     if path.is_file():
         return scan_file(path, policy=policy)
+    if not path.is_dir():
+        raise OSError(f"cannot scan {path}: no such directory")
     results: List[FileHazard] = []
     if not recursive:
         try:
@@ -255,13 +265,22 @@ def scan_path(path: Path, policy: str = "security", recursive: bool = False) -> 
         except OSError as exc:
             raise OSError(f"cannot list directory {path}: {exc}") from exc
         for child in children:
+            if child.is_symlink():
+                continue  # never follow symlinks outside the scan root
             if child.is_file():
                 results.extend(scan_file(child, policy=policy))
         return results
-    for root, dirs, files in os.walk(path):
-        dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+    for root, dirs, files in os.walk(path, followlinks=False):
+        dirs[:] = [
+            d
+            for d in dirs
+            if d not in _SKIP_DIRS and not (Path(root) / d).is_symlink()
+        ]
         for name in sorted(files):
-            results.extend(scan_file(Path(root) / name, policy=policy))
+            fp = Path(root) / name
+            if fp.is_symlink():
+                continue
+            results.extend(scan_file(fp, policy=policy))
     return results
 
 

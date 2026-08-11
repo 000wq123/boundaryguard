@@ -64,6 +64,13 @@ class TestCheck:
         r = run_cli("check", str(f))
         assert r.returncode == 0
 
+    def test_check_missing_path_exit_two_both_modes(self):
+        # A nonexistent path must NOT falsely report clean (exit 0).
+        r1 = run_cli("check", "/definitely/does/not/exist")
+        assert r1.returncode == 2
+        r2 = run_cli("check", "--recursive", "/definitely/does/not/exist")
+        assert r2.returncode == 2
+
 
 class TestSanitize:
     def test_sanitize_to_output(self, tmp_path: Path):
