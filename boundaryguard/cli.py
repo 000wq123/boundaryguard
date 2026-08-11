@@ -44,8 +44,19 @@ def _print_hazard_file(path: str, line: int, column: int, hazard: Hazard) -> Non
     )
 
 
+def _scan_or_error(args: argparse.Namespace):
+    """Run the scan, converting missing-path errors into exit code 2."""
+    try:
+        return scan_path(Path(args.path), policy=args.policy, recursive=args.recursive)
+    except OSError as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        return None
+
+
 def cmd_scan(args: argparse.Namespace) -> int:
-    findings = scan_path(Path(args.path), policy=args.policy, recursive=args.recursive)
+    findings = _scan_or_error(args)
+    if findings is None:
+        return 2
     for fh in findings:
         _print_hazard_file(fh.path, fh.line, fh.column, fh.hazard)
     if findings:
@@ -60,7 +71,9 @@ def cmd_scan(args: argparse.Namespace) -> int:
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    findings = scan_path(Path(args.path), policy=args.policy, recursive=args.recursive)
+    findings = _scan_or_error(args)
+    if findings is None:
+        return 2
     if findings:
         print(
             f"{len(findings)} hazard(s) found in {args.path} "

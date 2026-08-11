@@ -35,6 +35,7 @@ Everything here is standard-library only (no dependencies).
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
@@ -158,7 +159,7 @@ def find_suspicious(text: str, policy: str = "security") -> List[Hazard]:
 
 def contains_bidi_controls(text: str) -> bool:
     """True if *text* contains any bidi formatting control or mark."""
-    return any(ord(ch) in BIDI_FORMAT or ord(ch) in BIDI_MARK for ch in text)
+    return any((cp := ord(ch)) in BIDI_FORMAT or cp in BIDI_MARK for ch in text)
 
 
 def contains_zero_width(text: str) -> bool:
@@ -213,7 +214,7 @@ def sanitize(text: str, policy: str = "security") -> str:
 
 # ── File scanning ──────────────────────────────────────────────────────
 
-_SKIP_DIRS = {".git", ".venv", "venv", "__pycache__", "node_modules", ".tox", ".mypy_cache", ".pytest_cache", ".hg", ".svn", "unsloth_compiled_cache"}
+_SKIP_DIRS = {".git", ".hg", ".svn", ".venv", "venv", "__pycache__", "node_modules", ".tox", ".mypy_cache", ".pytest_cache", "dist", "build"}
 
 
 def scan_file(path: Path, policy: str = "security") -> List[FileHazard]:
@@ -249,11 +250,15 @@ def scan_path(path: Path, policy: str = "security", recursive: bool = False) -> 
         return scan_file(path, policy=policy)
     results: List[FileHazard] = []
     if not recursive:
-        for child in sorted(path.iterdir()):
+        try:
+            children = sorted(path.iterdir())
+        except OSError as exc:
+            raise OSError(f"cannot list directory {path}: {exc}") from exc
+        for child in children:
             if child.is_file():
                 results.extend(scan_file(child, policy=policy))
         return results
-    for root, dirs, files in path.walk():
+    for root, dirs, files in os.walk(path):
         dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
         for name in sorted(files):
             results.extend(scan_file(Path(root) / name, policy=policy))
