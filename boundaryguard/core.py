@@ -354,9 +354,11 @@ def _iter_hazard_chars(
 
     Memory stays bounded: input is read in :data:`_CHUNK`-sized pieces and
     decoded incrementally (so multibyte characters split across chunk
-    boundaries are handled correctly). Invalid UTF-8 calls
-    *on_decode_error(reason)* and stops. Only characters that match
-    *policy* are yielded.
+    boundaries are handled correctly), and line breaks are consumed
+    lazily from a regex iterator — never materialized into a list, so even
+    a chunk that is nothing but newlines uses a few KiB, not a list of a
+    million positions. Invalid UTF-8 calls *on_decode_error(reason)* and
+    stops. Only characters that match *policy* are yielded.
     """
     decoder = codecs.getincrementaldecoder("utf-8")("strict")
     pending_r = False
@@ -381,16 +383,16 @@ def _iter_hazard_chars(
             text = text[:-1]
         if not text:
             continue
-        breaks = [(m.start(), m.end()) for m in _LINE_BREAK_RE.finditer(text)]
-        bi = 0
+        break_iter = _LINE_BREAK_RE.finditer(text)
+        next_break = next(break_iter, None)
         line_start = 0
         for m in _HAZARD_RE.finditer(text):
             off = m.start()
-            while bi < len(breaks) and breaks[bi][0] < off:
+            while next_break is not None and next_break.start() < off:
                 line += 1
                 col = 1
-                line_start = breaks[bi][1]
-                bi += 1
+                line_start = next_break.end()
+                next_break = next(break_iter, None)
             ch = m.group(0)
             entry = _lookup(ch)
             if entry is None:
@@ -403,10 +405,11 @@ def _iter_hazard_chars(
             ):
                 continue
             yield (line, col + (off - line_start), ch)
-        for _, end in breaks[bi:]:
+        while next_break is not None:
             line += 1
             col = 1
-            line_start = end
+            line_start = next_break.end()
+            next_break = next(break_iter, None)
         col += len(text) - line_start
     # A truncated multibyte sequence at EOF is also invalid UTF-8.
     try:
@@ -442,6 +445,11 @@ def scan_file(
     The file is streamed in bounded-size chunks, so scanning does not load
     the whole file into memory. A symlink given directly is followed (the
     caller named it explicitly); tree scans never follow symlinks.
+
+    With *limit* set, scanning stops once *limit* hazards are found; the
+    unexamined tail of the file is not validated, so an invalid-UTF-8
+    region beyond the limit is not reported (pass ``limit=None`` for the
+    full fail-closed guarantee).
 
     Raises:
         ValueError: If *policy* is invalid, or *path* is not a regular file.
@@ -488,7 +496,7 @@ def _scan_single(
     try:
         fd = _open_fd(path, follow)
     except OSError as exc:
-        if not follow and exc.errno == errno.ELOOP:
+        if not follow and exc.errno in (errno.ELOOP, getattr(errno, "EMLINK", -1)):
             return  # symlink raced in after enumeration: silently skip
         if on_skip is not None:
             on_skip(str(path), f"cannot read ({exc.strerror or exc})")
