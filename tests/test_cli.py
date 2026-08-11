@@ -178,6 +178,48 @@ class TestSanitize:
         assert not out.exists()  # nothing partially written
 
 
+class TestTerminalInjection:
+    """Malicious filenames must not be able to forge or corrupt output."""
+
+    def test_filename_newline_cannot_forge_verdict(self, tmp_path: Path):
+        # A filename containing a newline must not be able to print a
+        # standalone "OK: clean" line that looks like a real verdict.
+        forged = "evil\nOK: clean (policy=security)."
+        f = tmp_path / forged
+        f.write_text(f"x = '{RLO}'\n", encoding="utf-8")
+        r = run_cli("scan", str(f))
+        assert r.returncode == 1
+        lines = r.stdout.splitlines()
+        assert "OK: clean (policy=security)." not in lines  # no forged verdict
+        assert any("\\u000A" in line for line in lines)  # newline visibly escaped
+
+    def test_filename_cannot_forge_finding(self, tmp_path: Path):
+        fake = "clean.py\nfake.py:9:9  U+202E RIGHT-TO-LEFT OVERRIDE (RLO) [bidi_format]"
+        f = tmp_path / fake
+        f.write_text(f"x = '{RLO}'\n", encoding="utf-8")
+        r = run_cli("scan", str(f))
+        assert not any(line.startswith("fake.py:9:9") for line in r.stdout.splitlines())
+
+    def test_filename_ansi_and_bidi_escaped(self, tmp_path: Path):
+        fname = f"auth{RLO}yp\x1b[31m.exe"
+        f = tmp_path / fname
+        f.write_text(f"x = '{RLO}'\n", encoding="utf-8")
+        r = run_cli("scan", str(f))
+        assert "\x1b" not in r.stdout
+        assert RLO not in r.stdout
+        assert "\\u202E" in r.stdout  # bidi char in filename rendered escaped
+        assert "\\u001B" in r.stdout  # ESC rendered escaped
+
+    def test_skip_warning_paths_escaped(self, tmp_path: Path):
+        evil = f"skip\x1b[31m\x07me"
+        (tmp_path / evil).write_bytes(b"\xff\xfe" + f"A{RLO}B".encode("utf-16-le"))
+        r = run_cli("check", str(tmp_path / evil))
+        assert r.returncode == 2
+        assert "\x1b" not in r.stderr
+        assert "\x07" not in r.stderr
+        assert "\\u001B" in r.stderr
+
+
 class TestFailClosedPrecedence:
     def test_check_findings_and_skips_exit_two(self, tmp_path: Path):
         # Hazards found AND a file that could not be scanned -> exit 2

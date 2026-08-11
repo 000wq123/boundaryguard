@@ -77,7 +77,10 @@ Drop `boundaryguard check --recursive .` into your CI and never merge invisible 
 ### Security behavior
 
 - **Missing paths fail loudly** — `check` on a nonexistent path exits `2`, never a false "clean".
-- **Symlinks are never followed** during tree scans, so a repo can't pull in content from outside its root via a symlinked file or directory.
+- **Symlinks are never followed** during tree scans, so a repo can't pull in content from outside its root via a symlinked file or directory. The check is race-proof where the OS allows: tree scans open with `O_NOFOLLOW` (Linux/macOS/BSD), so a file swapped to a symlink *between* enumeration and read fails with `ELOOP` and is skipped rather than followed.
+- **Streaming input, bounded memory** — files are scanned in 1 MiB chunks with an incremental UTF-8 decoder; a multi-gigabyte file uses a few MiB of RAM, not its own size. Lines are split on `\n`/`\r`/`\r\n` (matching how compilers and editors count lines); exotic Unicode separators (e.g. U+2028) are scanned as ordinary characters.
+- **Terminal-safe output** — filenames are attacker-controlled, so any path printed by the CLI (findings, first-finding lines, skip warnings) has control characters (C0/C1, DEL), line/paragraph separators, and bidi/zero-width hazards rendered as visible `\uXXXX` escapes. A repo can no longer forge an `OK: clean` verdict or fake finding with a newline, inject ANSI/OSC sequences, or bidi-reorder its own path in your report.
+- **Atomic sanitize** — `sanitize` writes to a temp file in the same directory and renames it into place; a failed or interrupted write can never leave a partially rewritten file. In-place edits preserve the original file's permissions. (As with `sed -i`, the replacement is a fresh inode, so ownership and hard links are not preserved — the file ends up owned by the current user.)
 - **Fail-closed scanning** — a file that *cannot be examined* is never reported clean. Files that aren't valid UTF-8 (e.g. UTF-16, binary), can't be read (permissions), or are special files (FIFOs, sockets, devices) are listed on stderr and force exit code `2` with a warning like:
 
   ```
@@ -86,7 +89,6 @@ Drop `boundaryguard check --recursive .` into your CI and never merge invisible 
 
   If your tree legitimately contains binary files, exclude them (e.g. scan `src/` only) rather than letting an unexamined file silently pass.
 - **Streaming scans** — `scan`/`check` stream findings as they are found, so memory stays bounded even on adversarial trees with millions of hazards.
-- **Atomic sanitize** — `sanitize` writes to a temp file in the same directory and renames it into place; a failed or interrupted write can never leave a partially rewritten file. In-place edits preserve the original file's permissions. (As with `sed -i`, the replacement is a fresh inode, so ownership and hard links are not preserved — the file ends up owned by the current user.)
 - **Sanitize refuses symlinks** — `sanitize` on a symlinked input (or `-o` pointing at a symlink) exits `2` rather than silently modifying the symlink's target.
 
 ---
@@ -158,7 +160,7 @@ Unicode bidi and zero-width characters aren't inherently malicious — they're r
 |----------|-----------|----------------|
 | `bidi_format` | LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI, and the deprecated ISS/ASS/IAFS/AFS/NDS/NODS (U+202A–U+202E, U+2066–U+206F) | **Trojan Source (CVE-2021-42574)** — text renders in a different order from its logical order |
 | `bidi_mark` | LRM, RLM (U+200E–U+200F) | Invisible; abused for obfuscation, legitimate for RTL text |
-| `zero_width` | ZWSP, ZWNJ, ZWJ, BOM (U+200B–U+200D, U+FEFF) | Invisible to humans, meaningful to machines; break comparisons and hide content |
+| `zero_width` | ZWSP, ZWNJ, ZWJ, WORD JOINER, BOM (U+200B–U+200D, U+2060, U+FEFF) | Invisible to humans, meaningful to machines; break comparisons and hide content |
 | `control` | C0 controls except `\t\n\r` | Non-printing bytes that corrupt logs, terminals, and parsers |
 
 ---
@@ -183,9 +185,14 @@ The CI pipeline runs the full suite on Python 3.9–3.12 **and** self-scans the 
 - [x] Trojan Source test corpus (CVE-2021-42574)
 - [x] Fail-closed scanning (non-UTF-8 / unreadable / special files never report clean)
 - [x] Streaming `scan_path_iter` (bounded memory on adversarial trees)
+- [x] Streaming file input (1 MiB chunks; multi-GB files use bounded RAM)
+- [x] Terminal-safe output (untrusted paths rendered with visible escapes)
+- [x] Race-proof tree scans (`O_NOFOLLOW` where available)
 - [ ] JSON / SARIF output for CI integrations
+- [ ] **Path-component scanning** — flag invisible-Unicode in *filenames* themselves (e.g. `auth\u202Eyp.exe`). Deliberately out of scope for now: the CLI already renders such names safely, and GitHub/other surfaces have their own handling; needs a distinct finding type and CI-semantics decision.
+- [ ] Windows CI coverage — junctions/reparse points and reserved names are not exercised by the (Linux) test matrix; `O_NOFOLLOW` is unavailable on Windows so tree scans there fall back to check-then-open.
+- [ ] macOS CI coverage — APFS normalization-insensitivity means NFC/NFD-equivalent names can't coexist on disk, so no double-scan is possible; worth verifying on real hardware.
 - [ ] `safe_fs` — path-confinement primitives (path-traversal hardening) as a second module
-- [ ] Windows/macOS CI coverage
 
 ---
 

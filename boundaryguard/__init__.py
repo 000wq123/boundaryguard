@@ -32,7 +32,7 @@ from .core import (
     scan_texts,
 )
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 __all__ = [
     "POLICIES",

@@ -52,6 +52,21 @@ class TestFindSuspicious:
         hazards = find_suspicious(f"ab{RLO}cd")
         assert hazards[0].offset == 2
 
+    def test_limit_bounds_results(self):
+        hazards = find_suspicious(f"{RLO}{RLO}{RLO}{RLO}{RLO}", limit=3)
+        assert len(hazards) == 3
+        hazards = find_suspicious(f"{RLO}{RLO}", limit=5)
+        assert len(hazards) == 2
+
+    def test_word_joiner_detected(self):
+        # U+2060 WORD JOINER is zero-width and machine-significant: it
+        # breaks string comparisons exactly like ZWSP.
+        hazards = find_suspicious("admin\u2060")
+        assert len(hazards) == 1
+        assert hazards[0].short == "WJ"
+        assert hazards[0].category == "zero_width"
+        assert sanitize("admin\u2060") == "admin"
+
     def test_empty_string(self):
         assert find_suspicious("") == []
 
@@ -76,6 +91,14 @@ class TestPolicies:
 
     def test_preserve_rtl_removes_zwsp(self):
         assert sanitize(f"a{ZWSP}b", policy="preserve_rtl") == "ab"
+
+    def test_find_suspicious_preserve_rtl_ignores_legitimate_marks(self):
+        # Regression: find_suspicious with preserve_rtl must not flag the
+        # marks/joiners that are legitimate for RTL text.
+        text = f"a{LRM}b{RLM}c{ZWNJ}d{ZWJ}e"
+        assert find_suspicious(text, policy="preserve_rtl") == []
+        # …but still flags the dangerous formatting controls.
+        assert find_suspicious(f"x{RLO}y", policy="preserve_rtl") != []
 
 
 class TestSanitize:
@@ -188,15 +211,31 @@ class TestFileScanning:
             scan_file(f)
 
     def test_scan_file_raises_on_special_file(self, tmp_path: Path):
+        # Run in a thread with a timeout so that a regression which opens
+        # the FIFO (blocking forever on a read) fails this test instead of
+        # hanging the whole suite.
+        import os
+        import threading
+
         fifo = tmp_path / "pipe"
         try:
-            import os
-
             os.mkfifo(fifo)
         except (AttributeError, OSError):
             pytest.skip("mkfifo not available")
-        with pytest.raises(ValueError):
-            scan_file(fifo)
+        result = {}
+
+        def target():
+            try:
+                scan_file(fifo)
+                result["value"] = "no-raise"
+            except ValueError as exc:
+                result["value"] = f"ValueError: {exc}"
+
+        t = threading.Thread(target=target)
+        t.start()
+        t.join(timeout=5)
+        assert not t.is_alive(), "scan_file blocked on the FIFO (hang regression!)"
+        assert str(result.get("value")).startswith("ValueError")
 
     def test_scan_path_directory_nonrecursive(self, tmp_path: Path):
         (tmp_path / "a.py").write_text(f"x = '{RLO}'", encoding="utf-8")
@@ -261,6 +300,22 @@ class TestFileScanning:
         found = list(scan_path_iter(tmp_path, recursive=True, limit=50))
         assert len(found) == 50
 
+    def test_streaming_giant_single_line(self, tmp_path: Path):
+        # A line larger than the 1 MiB scan chunk must still be scanned
+        # with exact line/column (input is streamed, not read whole).
+        f = tmp_path / "giant.txt"
+        f.write_text("a" * (2 * 1024 * 1024) + f"{RLO}end", encoding="utf-8")
+        results = scan_file(f)
+        assert len(results) == 1
+        assert results[0].line == 1
+        assert results[0].column == 2 * 1024 * 1024 + 1
+
+    def test_streaming_crlf_and_cr(self, tmp_path: Path):
+        f = tmp_path / "mixed.txt"
+        f.write_text(f"a\r\n{RLO}b\r{RLO}c\n{RLO}", encoding="utf-8")
+        results = scan_file(f)
+        assert [(r.line, r.column) for r in results] == [(2, 1), (3, 1), (4, 1)]
+
     def test_scan_path_reports_skips_via_callback(self, tmp_path: Path):
         # scan_path must not silently fail open: skips are observable.
         f = tmp_path / "evil16.txt"
@@ -287,5 +342,24 @@ class TestFileScanning:
         except OSError:
             pytest.skip("symlinks not permitted on this platform")
         found = scan_path(repo, recursive=True)
+        assert found == []
+        assert not any("secret" in f.path for f in found)
+
+    def test_scan_path_nonrecursive_skips_symlinked_files(self, tmp_path: Path):
+        # Same guarantee for the non-recursive walk (regression for a
+        # mutation-survival gap: only the recursive path was tested).
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        secret = outside / "secret.py"
+        secret.write_text(f"evil = '{RLO}'", encoding="utf-8")
+        repo = tmp_path / "repo"
+        repo.mkdir()
+        (repo / "ok.py").write_text("fine", encoding="utf-8")
+        link = repo / "innocent.py"
+        try:
+            link.symlink_to(secret)
+        except OSError:
+            pytest.skip("symlinks not permitted on this platform")
+        found = scan_path(repo, recursive=False)
         assert found == []
         assert not any("secret" in f.path for f in found)

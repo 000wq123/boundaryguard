@@ -46,7 +46,10 @@ skipped.
 
 from __future__ import annotations
 
+import codecs
+import errno
 import os
+import re
 import stat
 from dataclasses import dataclass
 from pathlib import Path
@@ -84,6 +87,10 @@ ZERO_WIDTH = {
     0x200B: ("ZWSP", "ZERO WIDTH SPACE", "zero_width"),
     0x200C: ("ZWNJ", "ZERO WIDTH NON-JOINER", "zero_width"),
     0x200D: ("ZWJ", "ZERO WIDTH JOINER", "zero_width"),
+    # U+2060 WORD JOINER: zero-width, machine-significant (breaks string
+    # comparisons and tokenization exactly like ZWSP) and has no
+    # legitimate rendering role in source, logs, or prompts.
+    0x2060: ("WJ", "WORD JOINER", "zero_width"),
     0xFEFF: ("BOM", "ZERO WIDTH NO-BREAK SPACE", "zero_width"),
 }
 
@@ -301,13 +308,128 @@ _SKIP_DIRS = {
     ".tox", ".mypy_cache", ".pytest_cache", "dist", "build",
 }
 
+# Files are scanned in bounded-size chunks (never read whole into memory),
+# so a multi-gigabyte file cannot exhaust RAM. Lines are split on the
+# universal line terminators (\n, \r, \r\n) — matching how compilers and
+# editors count lines for source code.
+_CHUNK = 1 << 20  # 1 MiB
 
-def _is_regular_file(path: Path) -> bool:
-    """True only for regular files (never FIFOs, sockets, or devices)."""
+_LINE_BREAK_RE = re.compile(r"\r\n|\r|\n")
+
+# One regex over every detectable hazard character: bidi controls, marks,
+# zero-width characters, and non-whitespace C0 controls.
+_HAZARD_RE = re.compile(
+    "[" + "".join(
+        re.escape(chr(cp))
+        for cp in sorted(set(_ALL_HAZARDS) | {ord(c) for c in _C0_EXCEPT_WS})
+    ) + "]"
+)
+
+
+# Callback signature: called with (path, reason) for every skipped file.
+SkipCallback = Callable[[str, str], None]
+
+
+def _open_fd(path: Path, follow: bool) -> int:
+    """Open *path* for reading, returning the raw file descriptor.
+
+    ``O_NONBLOCK`` is set so opening a FIFO never blocks waiting for a
+    writer (the caller rejects non-regular files by ``fstat``). When
+    *follow* is False, ``O_NOFOLLOW`` is added where the platform supports
+    it: a symlink that races in between enumeration and open fails with
+    ``ELOOP`` instead of being followed (closing the TOCTOU window).
+    """
+    flags = os.O_RDONLY | os.O_NONBLOCK
+    if not follow:
+        flags |= getattr(os, "O_NOFOLLOW", 0)
+    return os.open(str(path), flags)
+
+
+def _iter_hazard_chars(
+    fh: object,
+    policy: str,
+    on_decode_error: Callable[[str], None],
+) -> Iterator[Tuple[int, int, str]]:
+    """Stream *fh* (an open binary file) yielding ``(line, col, char)``.
+
+    Memory stays bounded: input is read in :data:`_CHUNK`-sized pieces and
+    decoded incrementally (so multibyte characters split across chunk
+    boundaries are handled correctly). Invalid UTF-8 calls
+    *on_decode_error(reason)* and stops. Only characters that match
+    *policy* are yielded.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")("strict")
+    pending_r = False
+    line = 1
+    col = 1
+    while True:
+        raw = fh.read(_CHUNK)  # type: ignore[attr-defined]
+        if not raw:
+            break
+        try:
+            text = decoder.decode(raw)
+        except UnicodeDecodeError as exc:
+            on_decode_error(f"not valid UTF-8 ({exc.reason})")
+            return
+        if pending_r:
+            # A lone \r at the end of the previous chunk may join a \n in
+            # this one; only treat it as a break once the next char is seen.
+            text = "\r" + text
+            pending_r = False
+        if text.endswith("\r"):
+            pending_r = True
+            text = text[:-1]
+        if not text:
+            continue
+        breaks = [(m.start(), m.end()) for m in _LINE_BREAK_RE.finditer(text)]
+        bi = 0
+        line_start = 0
+        for m in _HAZARD_RE.finditer(text):
+            off = m.start()
+            while bi < len(breaks) and breaks[bi][0] < off:
+                line += 1
+                col = 1
+                line_start = breaks[bi][1]
+                bi += 1
+            ch = m.group(0)
+            entry = _lookup(ch)
+            if entry is None:
+                continue
+            short, name, category = entry
+            if (
+                policy == "preserve_rtl"
+                and category in ("bidi_mark", "zero_width")
+                and ord(ch) in _PRESERVE_RTL
+            ):
+                continue
+            yield (line, col + (off - line_start), ch)
+        for _, end in breaks[bi:]:
+            line += 1
+            col = 1
+            line_start = end
+        col += len(text) - line_start
+    # A truncated multibyte sequence at EOF is also invalid UTF-8.
     try:
-        return stat.S_ISREG(path.stat().st_mode)
-    except OSError:
-        return False
+        decoder.decode(b"", final=True)
+    except UnicodeDecodeError as exc:
+        on_decode_error(f"not valid UTF-8 ({exc.reason})")
+
+
+def _make_file_hazard(path: Path, line: int, column: int, ch: str) -> FileHazard:
+    short, name, category = _lookup(ch)
+    return FileHazard(
+        hazard=Hazard(
+            codepoint=ord(ch),
+            short=short,
+            name=name,
+            category=category,
+            offset=column - 1,
+            escaped=f"U+{ord(ch):04X}",
+        ),
+        path=str(path),
+        line=line,
+        column=column,
+    )
 
 
 def scan_file(
@@ -317,41 +439,37 @@ def scan_file(
 ) -> List[FileHazard]:
     """Scan a single UTF-8 text file, returning hazards with line/column.
 
+    The file is streamed in bounded-size chunks, so scanning does not load
+    the whole file into memory. A symlink given directly is followed (the
+    caller named it explicitly); tree scans never follow symlinks.
+
     Raises:
-        ValueError: If *policy* is invalid.
+        ValueError: If *policy* is invalid, or *path* is not a regular file.
         UndecodableFileError: If the file is not valid UTF-8 (fail-closed:
             an unreadable file is never reported as clean).
         OSError: If the file cannot be read (missing, permissions).
     """
     _validate_policy(policy)
-    if not _is_regular_file(path):
-        raise ValueError(f"not a regular file: {path}")
-    try:
-        data = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        raise UndecodableFileError(
-            f"cannot decode {path} as UTF-8 ({exc.reason})"
-        ) from exc
-    except OSError:
-        raise
-    results: List[FileHazard] = []
-    for line_no, line in enumerate(data.splitlines(), start=1):
-        for hazard in find_suspicious(line, policy=policy, limit=limit):
-            results.append(
-                FileHazard(
-                    hazard=hazard,
-                    path=str(path),
-                    line=line_no,
-                    column=hazard.offset + 1,
-                )
+    fd = _open_fd(path, follow=True)
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise ValueError(f"not a regular file: {path}")
+        results: List[FileHazard] = []
+        decode_failed: List[str] = []
+
+        def on_decode_error(reason: str) -> None:
+            decode_failed.append(reason)
+
+        for line, column, ch in _iter_hazard_chars(fh, policy, on_decode_error):
+            results.append(_make_file_hazard(path, line, column, ch))
+            if limit is not None and len(results) >= limit:
+                break
+        if decode_failed:
+            raise UndecodableFileError(
+                f"cannot decode {path} as UTF-8 ({decode_failed[0]})"
             )
-        if limit is not None and len(results) >= limit:
-            break
-    return results
-
-
-# Callback signature: called with (path, reason) for every skipped file.
-SkipCallback = Callable[[str, str], None]
+        return results
 
 
 def _scan_single(
@@ -359,33 +477,43 @@ def _scan_single(
     policy: str,
     limit: Optional[int],
     on_skip: Optional[SkipCallback],
+    follow: bool = True,
 ) -> Iterator[FileHazard]:
-    if not _is_regular_file(path):
-        if on_skip is not None:
-            on_skip(str(path), "not a regular file (FIFO/socket/device)")
-        return
+    """Stream one file, skipping (never reporting clean) unexaminable files.
+
+    With *follow* False (tree walks), a symlink is refused at open time via
+    ``O_NOFOLLOW`` — if one races in after enumeration it is silently
+    skipped, closing the TOCTOU window.
+    """
     try:
-        data = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError as exc:
-        if on_skip is not None:
-            on_skip(str(path), f"not valid UTF-8 ({exc.reason})")
-        return
+        fd = _open_fd(path, follow)
     except OSError as exc:
+        if not follow and exc.errno == errno.ELOOP:
+            return  # symlink raced in after enumeration: silently skip
         if on_skip is not None:
             on_skip(str(path), f"cannot read ({exc.strerror or exc})")
         return
     count = 0
-    for line_no, line in enumerate(data.splitlines(), start=1):
-        for hazard in find_suspicious(line, policy=policy):
-            yield FileHazard(
-                hazard=hazard,
-                path=str(path),
-                line=line_no,
-                column=hazard.offset + 1,
-            )
-            count += 1
-            if limit is not None and count >= limit:
+    try:
+        with os.fdopen(fd, "rb") as fh:
+            st = os.fstat(fh.fileno())
+            if not stat.S_ISREG(st.st_mode):
+                if on_skip is not None:
+                    on_skip(str(path), "not a regular file (FIFO/socket/device)")
                 return
+
+            def on_decode_error(reason: str) -> None:
+                if on_skip is not None:
+                    on_skip(str(path), reason)
+
+            for line, column, ch in _iter_hazard_chars(fh, policy, on_decode_error):
+                yield _make_file_hazard(path, line, column, ch)
+                count += 1
+                if limit is not None and count >= limit:
+                    return
+    except OSError as exc:
+        if on_skip is not None:
+            on_skip(str(path), f"cannot read ({exc.strerror or exc})")
 
 
 def scan_path_iter(
@@ -430,7 +558,7 @@ def scan_path_iter(
         for child in children:
             if child.is_symlink():
                 continue  # never follow symlinks outside the scan root
-            yield from _scan_single(child, policy, limit, on_skip)
+            yield from _scan_single(child, policy, limit, on_skip, follow=False)
         return
 
     def _on_walk_error(exc: OSError) -> None:
@@ -447,7 +575,7 @@ def scan_path_iter(
             fp = Path(root) / name
             if fp.is_symlink():
                 continue
-            yield from _scan_single(fp, policy, limit, on_skip)
+            yield from _scan_single(fp, policy, limit, on_skip, follow=False)
 
 
 def scan_path(

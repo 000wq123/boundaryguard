@@ -30,6 +30,7 @@ from typing import Dict, Iterator, List, Optional
 
 from . import __version__
 from .core import (
+    _ALL_HAZARDS,
     Hazard,
     UndecodableFileError,
     explain_character,
@@ -43,15 +44,44 @@ _POLICIES = ("security", "preserve_rtl")
 # How many skipped files to list in the warning (count is always shown).
 _MAX_SKIP_DETAIL = 10
 
+# Line/paragraph separators can forge lines in terminal output.
+_LINE_FORGERY = (0x2028, 0x2029)
+
 
 def _render(hazard: Hazard) -> str:
     """Render one hazard as a visible escaped string."""
     return f"\\u{hazard.codepoint:04X}"
 
 
+def _display(text: str) -> str:
+    """Render a possibly-untrusted string safely for terminal output.
+
+    Control characters (C0, DEL, C1), line/paragraph separators, and the
+    invisible-Unicode hazards themselves (bidi controls, marks, zero-width
+    characters) are replaced with visible ``\\uXXXX`` escapes. Without
+    this, a malicious repository can control the terminal through its
+    filenames: a newline can forge an ``OK: clean`` verdict or a fake
+    finding, and ANSI/OSC sequences or bidi reordering can corrupt or
+    lie inside the report.
+    """
+    out: List[str] = []
+    for ch in text:
+        cp = ord(ch)
+        if (
+            cp < 0x20
+            or 0x7F <= cp <= 0x9F
+            or cp in _LINE_FORGERY
+            or cp in _ALL_HAZARDS
+        ):
+            out.append(f"\\u{cp:04X}")
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
 def _print_hazard_file(path: str, line: int, column: int, hazard: Hazard) -> None:
     print(
-        f"{path}:{line}:{column}  "
+        f"{_display(path)}:{line}:{column}  "
         f"{hazard.escaped} {hazard.name} ({hazard.short}) "
         f"[{hazard.category}]  render={_render(hazard)!r}"
     )
@@ -67,7 +97,7 @@ def _report_skips(info: Dict[str, object]) -> None:
         file=sys.stderr,
     )
     for path, reason in skipped:
-        print(f"  skipped {path}: {reason}", file=sys.stderr)
+        print(f"  skipped {_display(path)}: {_display(reason)}", file=sys.stderr)
 
 
 def _stream_scan(args: argparse.Namespace, info: Dict[str, object]) -> Iterator[object]:
@@ -148,7 +178,7 @@ def cmd_check(args: argparse.Namespace) -> int:
             f"{findings} hazard(s) found in {args.path} "
             f"(policy={args.policy}). First: "
             f"{first.hazard.escaped} {first.hazard.name} "
-            f"at {first.path}:{first.line}:{first.column}"
+            f"at {_display(first.path)}:{first.line}:{first.column}"
         )
         return _scan_exit_code(info, findings)
     if info["skip_count"]:
