@@ -16,8 +16,11 @@ Usage:
 """
 
 from .core import (
+    POLICIES,
     FileHazard,
     Hazard,
+    SkipCallback,
+    UndecodableFileError,
     contains_bidi_controls,
     contains_zero_width,
     explain_character,
@@ -25,14 +28,18 @@ from .core import (
     sanitize,
     scan_file,
     scan_path,
+    scan_path_iter,
     scan_texts,
 )
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 
 __all__ = [
+    "POLICIES",
     "FileHazard",
     "Hazard",
+    "SkipCallback",
+    "UndecodableFileError",
     "contains_bidi_controls",
     "contains_zero_width",
     "explain_character",
@@ -40,6 +47,7 @@ __all__ = [
     "sanitize",
     "scan_file",
     "scan_path",
+    "scan_path_iter",
     "scan_texts",
     "__version__",
 ]

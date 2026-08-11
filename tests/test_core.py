@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from boundaryguard import (
+    POLICIES,
+    UndecodableFileError,
     contains_bidi_controls,
     contains_zero_width,
     explain_character,
@@ -12,6 +14,7 @@ from boundaryguard import (
     sanitize,
     scan_file,
     scan_path,
+    scan_path_iter,
 )
 
 RLI = "\u2067"  # RIGHT-TO-LEFT ISOLATE
@@ -109,8 +112,53 @@ class TestExplain:
     def test_explains_plain_ascii(self):
         assert "LATIN CAPITAL LETTER A" in explain_character("A")
 
-    def test_explain_empty(self):
-        assert "(empty" in explain_character("")
+    def test_explain_wrong_length_raises(self):
+        # The docstring promises single-character input only; anything
+        # else must fail loudly, not silently return a wrong answer.
+        with pytest.raises(ValueError):
+            explain_character("")
+        with pytest.raises(ValueError):
+            explain_character("ab")
+        with pytest.raises(TypeError):
+            explain_character(None)
+
+
+class TestApiContract:
+    def test_invalid_policy_raises_everywhere(self):
+        # An invalid policy must never silently fall back to "security".
+        for pol in ["banana", "", None, "SECURITY", "garbage", 42]:
+            with pytest.raises(ValueError):
+                find_suspicious(f"a{RLO}b", policy=pol)
+            with pytest.raises(ValueError):
+                sanitize(f"a{RLO}b", policy=pol)
+        assert POLICIES == ("security", "preserve_rtl")
+
+    def test_non_string_input_raises_typeerror(self):
+        with pytest.raises(TypeError):
+            find_suspicious(None)
+        with pytest.raises(TypeError):
+            find_suspicious(b"bytes")
+        with pytest.raises(TypeError):
+            sanitize(None)
+        with pytest.raises(TypeError):
+            sanitize(123)
+        with pytest.raises(TypeError):
+            contains_bidi_controls(1)
+
+    def test_deprecated_bidi_controls_detected(self):
+        # U+206A ISS (deprecated but still able to reorder older displays).
+        hazards = find_suspicious("\u206a")
+        assert len(hazards) == 1
+        assert hazards[0].category == "bidi_format"
+        assert hazards[0].short == "ISS"
+
+    def test_get_type_hints_works_on_all_public_functions(self):
+        import typing
+
+        from boundaryguard import core
+
+        for name in ("find_suspicious", "sanitize", "scan_file", "scan_path_iter"):
+            typing.get_type_hints(getattr(core, name))
 
 
 class TestFileScanning:
@@ -124,10 +172,31 @@ class TestFileScanning:
         assert fh.column == 9  # flag = " → column 8 is the quote, RLO at 9
         assert fh.hazard.short == "RLO"
 
-    def test_scan_file_skips_binary(self, tmp_path: Path):
+    def test_scan_file_fails_closed_on_binary(self, tmp_path: Path):
+        # A file that cannot be decoded must NOT be reported clean.
         f = tmp_path / "blob.bin"
         f.write_bytes(b"\x00\xff\xfe\x01\x00")
-        assert scan_file(f) == []
+        with pytest.raises(UndecodableFileError):
+            scan_file(f)
+
+    def test_scan_file_fails_closed_on_utf16(self, tmp_path: Path):
+        # A UTF-16 file containing a real RLO is a genuine hazard; it must
+        # raise, not silently become "clean".
+        f = tmp_path / "evil16.txt"
+        f.write_bytes(b"\xff\xfe" + "HELLO\u202eSECRET".encode("utf-16-le"))
+        with pytest.raises(UndecodableFileError):
+            scan_file(f)
+
+    def test_scan_file_raises_on_special_file(self, tmp_path: Path):
+        fifo = tmp_path / "pipe"
+        try:
+            import os
+
+            os.mkfifo(fifo)
+        except (AttributeError, OSError):
+            pytest.skip("mkfifo not available")
+        with pytest.raises(ValueError):
+            scan_file(fifo)
 
     def test_scan_path_directory_nonrecursive(self, tmp_path: Path):
         (tmp_path / "a.py").write_text(f"x = '{RLO}'", encoding="utf-8")
@@ -153,6 +222,44 @@ class TestFileScanning:
             scan_path(tmp_path / "does-not-exist", recursive=True)
         with pytest.raises(OSError):
             scan_path(tmp_path / "does-not-exist", recursive=False)
+
+    def test_scan_path_iter_reports_skips_fail_closed(self, tmp_path: Path):
+        # Non-UTF-8 files are reported via on_skip, never silently clean.
+        f = tmp_path / "evil16.txt"
+        f.write_bytes(b"\xff\xfe" + "A\u202eB".encode("utf-16-le"))
+        skips = []
+        found = list(
+            scan_path_iter(tmp_path, recursive=True, on_skip=lambda p, r: skips.append((p, r)))
+        )
+        assert found == []
+        assert len(skips) == 1
+        assert "evil16.txt" in skips[0][0]
+        assert "UTF-8" in skips[0][1]
+
+    def test_scan_path_iter_skips_fifo(self, tmp_path: Path):
+        # A FIFO must be reported via on_skip, never hang the scan.
+        import os
+
+        try:
+            os.mkfifo(tmp_path / "pipe")
+        except (AttributeError, OSError):
+            pytest.skip("mkfifo not available")
+        skips = []
+        list(
+            scan_path_iter(tmp_path, recursive=True, on_skip=lambda p, r: skips.append((p, r)))
+        )
+        assert len(skips) == 1
+        assert "pipe" in skips[0][0]
+
+    def test_scan_path_iter_missing_path_raises(self, tmp_path: Path):
+        with pytest.raises(OSError):
+            list(scan_path_iter(tmp_path / "nope", recursive=True))
+
+    def test_scan_path_iter_limit_bounds_memory(self, tmp_path: Path):
+        f = tmp_path / "many.txt"
+        f.write_text(f"{RLO}" * 10000, encoding="utf-8")
+        found = list(scan_path_iter(tmp_path, recursive=True, limit=50))
+        assert len(found) == 50
 
     def test_scan_path_skips_symlinked_files(self, tmp_path: Path):
         # A symlink inside the tree must not pull in content from outside.

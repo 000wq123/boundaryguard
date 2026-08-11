@@ -68,9 +68,9 @@ suspicious.py:4:14  U+202E RIGHT-TO-LEFT OVERRIDE (RLO) [bidi_format]  render='\
 
 | Code | Meaning |
 |------|---------|
-| `0` | No hazards found |
+| `0` | Clean — every requested file was examined and nothing was found |
 | `1` | Hazards found |
-| `2` | Usage or I/O error |
+| `2` | Usage or I/O error — **or files could not be examined** (see below) |
 
 Drop `boundaryguard check --recursive .` into your CI and never merge invisible code again.
 
@@ -78,6 +78,16 @@ Drop `boundaryguard check --recursive .` into your CI and never merge invisible 
 
 - **Missing paths fail loudly** — `check` on a nonexistent path exits `2`, never a false "clean".
 - **Symlinks are never followed** during tree scans, so a repo can't pull in content from outside its root via a symlinked file or directory.
+- **Fail-closed scanning** — a file that *cannot be examined* is never reported clean. Files that aren't valid UTF-8 (e.g. UTF-16, binary), can't be read (permissions), or are special files (FIFOs, sockets, devices) are listed on stderr and force exit code `2` with a warning like:
+
+  ```
+  warning: 2 file(s) could not be scanned (non-UTF-8, unreadable, or special files) — result is incomplete.
+  ```
+
+  If your tree legitimately contains binary files, exclude them (e.g. scan `src/` only) rather than letting an unexamined file silently pass.
+- **Streaming scans** — `scan`/`check` stream findings as they are found, so memory stays bounded even on adversarial trees with millions of hazards.
+- **Atomic sanitize** — `sanitize` writes to a temp file in the same directory and renames it into place; a failed or interrupted write can never leave a partially rewritten file. In-place edits preserve the original file's permissions.
+- **Sanitize refuses symlinks** — `sanitize` on a symlinked input (or `-o` pointing at a symlink) exits `2` rather than silently modifying the symlink's target.
 
 ---
 
@@ -91,6 +101,7 @@ from boundaryguard import (
     contains_bidi_controls,
     contains_zero_width,
     scan_path,
+    scan_path_iter,
 )
 
 text = "user: \u202e admin"
@@ -108,7 +119,22 @@ print(repr(sanitize(text)))              # 'user:  admin'
 # File scanning with line/column
 for fh in scan_path("src", recursive=True):
     print(fh.path, fh.line, fh.column, fh.hazard.name)
+
+# Streaming scan with fail-closed skip reporting (bounded memory)
+skipped = []
+for fh in scan_path_iter("src", recursive=True, on_skip=lambda p, r: skipped.append((p, r))):
+    print(fh.path, fh.line, fh.column, fh.hazard.name)
+if skipped:
+    print(f"{len(skipped)} file(s) could not be scanned: {skipped}")
 ```
+
+**Fail-closed API:** `scan_file` raises `UndecodableFileError` for non-UTF-8
+input and `OSError` for unreadable files — a file that cannot be decoded is
+never reported clean. `scan_path_iter` reports unexaminable files through
+its `on_skip(path, reason)` callback. Invalid policies raise `ValueError`
+(never a silent fallback), and non-string input raises `TypeError`.
+`scan_path_iter` is a generator (streaming); `scan_path` is a convenience
+wrapper that returns the complete list in memory.
 
 ---
 
@@ -130,7 +156,7 @@ Unicode bidi and zero-width characters aren't inherently malicious — they're r
 
 | Category | Characters | Why it matters |
 |----------|-----------|----------------|
-| `bidi_format` | LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI (U+202A–U+202E, U+2066–U+2069) | **Trojan Source (CVE-2021-42574)** — text renders in a different order from its logical order |
+| `bidi_format` | LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI, and the deprecated ISS/ASS/IAFS/AFS/NDS/NODS (U+202A–U+202E, U+2066–U+206F) | **Trojan Source (CVE-2021-42574)** — text renders in a different order from its logical order |
 | `bidi_mark` | LRM, RLM (U+200E–U+200F) | Invisible; abused for obfuscation, legitimate for RTL text |
 | `zero_width` | ZWSP, ZWNJ, ZWJ, BOM (U+200B–U+200D, U+FEFF) | Invisible to humans, meaningful to machines; break comparisons and hide content |
 | `control` | C0 controls except `\t\n\r` | Non-printing bytes that corrupt logs, terminals, and parsers |
@@ -155,8 +181,9 @@ The CI pipeline runs the full suite on Python 3.9–3.12 **and** self-scans the 
 - [x] Detection + sanitization with `security` / `preserve_rtl` policies
 - [x] CLI (`scan` / `check` / `inspect` / `sanitize`) with CI exit codes
 - [x] Trojan Source test corpus (CVE-2021-42574)
+- [x] Fail-closed scanning (non-UTF-8 / unreadable / special files never report clean)
+- [x] Streaming `scan_path_iter` (bounded memory on adversarial trees)
 - [ ] JSON / SARIF output for CI integrations
-- [ ] Recursive repository scanning performance pass
 - [ ] `safe_fs` — path-confinement primitives (path-traversal hardening) as a second module
 - [ ] Windows/macOS CI coverage
 

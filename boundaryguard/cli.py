@@ -8,28 +8,40 @@ Subcommands:
 * ``check``     — like scan, but quiet: only prints a one-line summary.
                   Exit 0 = clean, 1 = hazards found, 2 = error.
 * ``inspect``   — explain the characters in a string argument.
-* ``sanitize``  — remove hazards from a file (in place or to a new file).
+* ``sanitize``  — remove hazards from a file (in place or to a new file),
+                  written atomically and never through a symlink.
 
 Exit codes are CI-friendly: 0 clean, 1 findings, 2 usage/IO error.
+
+Fail-closed: files that could not be examined (non-UTF-8, unreadable,
+FIFOs, sockets, devices) are reported to stderr and force exit code 2 —
+a file that cannot be scanned is never silently reported as clean.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
+import stat
 import sys
+import tempfile
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, Iterator, List, Optional, Tuple
 
 from . import __version__
 from .core import (
     Hazard,
+    UndecodableFileError,
     explain_character,
     find_suspicious,
     sanitize,
-    scan_path,
+    scan_path_iter,
 )
 
 _POLICIES = ("security", "preserve_rtl")
+
+# How many skipped files to list in the warning (count is always shown).
+_MAX_SKIP_DETAIL = 10
 
 
 def _render(hazard: Hazard) -> str:
@@ -45,44 +57,103 @@ def _print_hazard_file(path: str, line: int, column: int, hazard: Hazard) -> Non
     )
 
 
-def _scan_or_error(args: argparse.Namespace):
-    """Run the scan, converting missing-path errors into exit code 2."""
+def _report_skips(info: Dict[str, object]) -> None:
+    """Print a fail-closed warning listing files that could not be examined."""
+    count = int(info["skip_count"])
+    skipped = list(info["skipped"])
+    print(
+        f"warning: {count} file(s) could not be scanned "
+        f"(non-UTF-8, unreadable, or special files) — result is incomplete.",
+        file=sys.stderr,
+    )
+    for path, reason in skipped:
+        print(f"  skipped {path}: {reason}", file=sys.stderr)
+
+
+def _stream_scan(args: argparse.Namespace, info: Dict[str, object]) -> Iterator[object]:
+    """Yield :class:`FileHazard` from a scan, collecting skip events into *info*.
+
+    Never raises on a missing path — instead ``info["error"]`` is set and
+    the caller returns exit code 2. Skipped files are counted in
+    ``info["skip_count"]`` with the first few listed in ``info["skipped"]``.
+    """
+
+    def on_skip(path: str, reason: str) -> None:
+        info["skip_count"] = int(info["skip_count"]) + 1
+        if len(info["skipped"]) < _MAX_SKIP_DETAIL:
+            info["skipped"].append((path, reason))
+
+    if not args.path:
+        info["error"] = "empty path"
+        return
     try:
-        return scan_path(Path(args.path), policy=args.policy, recursive=args.recursive)
+        iterator = scan_path_iter(
+            Path(args.path),
+            policy=args.policy,
+            recursive=args.recursive,
+            on_skip=on_skip,
+        )
+        for fh in iterator:
+            yield fh
     except OSError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return None
+        info["error"] = str(exc)
+
+
+def _scan_exit_code(info: Dict[str, object], findings: int) -> int:
+    """Fail-closed exit code: any unexamined file dominates the result."""
+    if info.get("error"):
+        return 2
+    if info["skip_count"]:
+        _report_skips(info)
+        return 2
+    return 1 if findings else 0
 
 
 def cmd_scan(args: argparse.Namespace) -> int:
-    findings = _scan_or_error(args)
-    if findings is None:
-        return 2
-    for fh in findings:
+    info: Dict[str, object] = {"skip_count": 0, "skipped": [], "error": None}
+    findings = 0
+    for fh in _stream_scan(args, info):
         _print_hazard_file(fh.path, fh.line, fh.column, fh.hazard)
+        findings += 1
+    if info.get("error"):
+        print(f"error: {info['error']}", file=sys.stderr)
+        return 2
     if findings:
         print(
-            f"\n{len(findings)} invisible-Unicode hazard(s) found "
+            f"\n{findings} invisible-Unicode hazard(s) found "
             f"(policy={args.policy}).",
             file=sys.stderr,
         )
-        return 1
+        return _scan_exit_code(info, findings)
+    if info["skip_count"]:
+        _report_skips(info)
+        return 2
     print(f"OK: no invisible-Unicode hazards found in {args.path} (policy={args.policy}).")
     return 0
 
 
 def cmd_check(args: argparse.Namespace) -> int:
-    findings = _scan_or_error(args)
-    if findings is None:
+    info: Dict[str, object] = {"skip_count": 0, "skipped": [], "error": None}
+    findings = 0
+    first = None
+    for fh in _stream_scan(args, info):
+        if findings == 0:
+            first = fh
+        findings += 1
+    if info.get("error"):
+        print(f"error: {info['error']}", file=sys.stderr)
         return 2
     if findings:
         print(
-            f"{len(findings)} hazard(s) found in {args.path} "
+            f"{findings} hazard(s) found in {args.path} "
             f"(policy={args.policy}). First: "
-            f"{findings[0].hazard.escaped} {findings[0].hazard.name} "
-            f"at {findings[0].path}:{findings[0].line}:{findings[0].column}"
+            f"{first.hazard.escaped} {first.hazard.name} "
+            f"at {first.path}:{first.line}:{first.column}"
         )
-        return 1
+        return _scan_exit_code(info, findings)
+    if info["skip_count"]:
+        _report_skips(info)
+        return 2
     print(f"OK: {args.path} clean (policy={args.policy}).")
     return 0
 
@@ -99,21 +170,57 @@ def cmd_inspect(args: argparse.Namespace) -> int:
 
 def cmd_sanitize(args: argparse.Namespace) -> int:
     src = Path(args.input)
+    if src.is_symlink():
+        print(
+            f"error: refusing to sanitize symlink {src} "
+            f"(it would modify the symlink target)",
+            file=sys.stderr,
+        )
+        return 2
+    if not src.exists():
+        print(f"error: cannot read {src}: no such file", file=sys.stderr)
+        return 2
     try:
         raw = src.read_text(encoding="utf-8")
+    except (UnicodeDecodeError, UndecodableFileError):
+        print(f"error: {src} is not valid UTF-8; nothing written", file=sys.stderr)
+        return 2
     except OSError as exc:
         print(f"error: cannot read {src}: {exc}", file=sys.stderr)
         return 2
     clean = sanitize(raw, policy=args.policy)
-    if args.output:
-        out = Path(args.output)
-    else:
-        out = src
+    out = Path(args.output) if args.output else src
+    if out.is_symlink():
+        print(
+            f"error: refusing to write through symlink {out} "
+            f"(it would overwrite the symlink target)",
+            file=sys.stderr,
+        )
+        return 2
+    # Atomic write: temp file in the same directory, then rename. A failed
+    # or interrupted write can never leave a partially rewritten file.
+    tmp_path: Optional[str] = None
     try:
-        out.write_text(clean, encoding="utf-8")
+        fd, tmp_path = tempfile.mkstemp(
+            dir=str(out.parent if str(out.parent) else Path(".")),
+            prefix=".boundaryguard-",
+            suffix=".tmp",
+        )
+        with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
+            handle.write(clean)
+        if out == src:
+            # Preserve the original file's permissions for in-place edits.
+            os.chmod(tmp_path, stat.S_IMODE(src.stat().st_mode))
+        os.replace(tmp_path, out)
     except OSError as exc:
         print(f"error: cannot write {out}: {exc}", file=sys.stderr)
         return 2
+    finally:
+        if tmp_path is not None and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
     removed = len(raw) - len(clean)
     print(
         f"wrote {out} ({removed} hazard character(s) removed, "
@@ -139,7 +246,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_scan.add_argument("--policy", choices=_POLICIES, default="security", help="scan policy")
     p_scan.set_defaults(func=cmd_scan)
 
-    p_check = sub.add_parser("check", help="CI-friendly: exit 0 clean, 1 findings")
+    p_check = sub.add_parser("check", help="CI-friendly: exit 0 clean, 1 findings, 2 error")
     p_check.add_argument("path", help="file or directory to check")
     p_check.add_argument("-r", "--recursive", action="store_true", help="walk directories recursively")
     p_check.add_argument("--policy", choices=_POLICIES, default="security", help="scan policy")
@@ -150,7 +257,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_inspect.add_argument("--policy", choices=_POLICIES, default="security", help="scan policy")
     p_inspect.set_defaults(func=cmd_inspect)
 
-    p_sanitize = sub.add_parser("sanitize", help="remove hazards from a file")
+    p_sanitize = sub.add_parser("sanitize", help="remove hazards from a file (atomic)")
     p_sanitize.add_argument("input", help="input file (UTF-8)")
     p_sanitize.add_argument("-o", "--output", help="output file; defaults to in-place")
     p_sanitize.add_argument("--policy", choices=_POLICIES, default="security", help="sanitize policy")
@@ -160,12 +267,22 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
+    # Die quietly on SIGPIPE (e.g. `boundaryguard scan big | head`), like
+    # standard Unix tools, instead of printing a BrokenPipeError traceback.
+    try:
+        import signal
+
+        signal.signal(signal.SIGPIPE, signal.SIG_DFL)
+    except (ImportError, AttributeError, ValueError):
+        pass  # non-POSIX platform or not the main thread
     parser = build_parser()
     args = parser.parse_args(argv)
     try:
         return args.func(args)
     except KeyboardInterrupt:
         return 130
+    except BrokenPipeError:
+        return 141
 
 
 if __name__ == "__main__":

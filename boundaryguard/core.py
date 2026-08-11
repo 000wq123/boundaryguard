@@ -3,11 +3,12 @@
 Detect, explain, and optionally remove Unicode characters that can be
 abused for deception:
 
-* **Bidi formatting controls** (LRE/RLE/PDF/LRO/RLO, LRI/RLI/FSI/PDI) —
-  the attack surface of *Trojan Source* (CVE-2021-42574, arXiv:2111.00169).
-  These make source code render in a different order from its logical
-  token order, so a human reviewer can approve code that does something
-  other than what it looks like.
+* **Bidi formatting controls** (LRE/RLE/PDF/LRO/RLO, LRI/RLI/FSI/PDI,
+  and the deprecated ISS/ASS/IAFS/AFS/NDS/NODS) — the attack surface of
+  *Trojan Source* (CVE-2021-42574, arXiv:2111.00169). These make source
+  code render in a different order from its logical token order, so a
+  human reviewer can approve code that does something other than what it
+  looks like.
 
 * **Bidi marks** (LRM/RLM) — harmless on their own and *required* for
   correct rendering of mixed left-to-right/right-to-left text, but they
@@ -31,14 +32,25 @@ The module provides detection (find + explain) and sanitization
   human-facing text in Arabic, Hebrew, Persian, and Urdu.
 
 Everything here is standard-library only (no dependencies).
+
+Fail-closed scanning
+--------------------
+``scan_file`` / ``scan_path_iter`` never silently report a file as
+clean when it could not actually be examined. Files that cannot be
+decoded as UTF-8, cannot be read, or are special files (FIFOs, sockets,
+devices) are reported through the ``on_skip`` callback, and callers are
+expected to treat skipped files as "could not verify" rather than
+"verified clean". The CLI exits with an error code when anything was
+skipped.
 """
 
 from __future__ import annotations
 
 import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Iterable, List, Optional, Tuple
+from typing import Callable, Iterable, Iterator, List, Optional, Tuple
 
 # ── Character tables ────────────────────────────────────────────────────
 # codepoint -> (short name, full name, category)
@@ -53,6 +65,14 @@ BIDI_FORMAT = {
     0x2067: ("RLI", "RIGHT-TO-LEFT ISOLATE", "bidi_format"),
     0x2068: ("FSI", "FIRST STRONG ISOLATE", "bidi_format"),
     0x2069: ("PDI", "POP DIRECTIONAL ISOLATE", "bidi_format"),
+    # Deprecated bidi controls (Unicode 6.3+): still invisible to humans
+    # and able to reorder rendering in older display stacks.
+    0x206A: ("ISS", "INHIBIT SYMMETRIC SWAPPING", "bidi_format"),
+    0x206B: ("ASS", "ACTIVATE SYMMETRIC SWAPPING", "bidi_format"),
+    0x206C: ("IAFS", "INHIBIT ARABIC FORM SHAPING", "bidi_format"),
+    0x206D: ("AFS", "ACTIVATE ARABIC FORM SHAPING", "bidi_format"),
+    0x206E: ("NDS", "NATIONAL DIGIT SHAPES", "bidi_format"),
+    0x206F: ("NODS", "NOMINAL DIGIT SHAPES", "bidi_format"),
 }
 
 BIDI_MARK = {
@@ -75,6 +95,19 @@ _PRESERVE_RTL = {0x200E, 0x200F, 0x200C, 0x200D}
 _C0_EXCEPT_WS = frozenset(chr(c) for c in range(0x20) if c not in (0x09, 0x0A, 0x0D))
 
 _ALL_HAZARDS = {**BIDI_FORMAT, **BIDI_MARK, **ZERO_WIDTH}
+
+# Valid policy names. Anything else raises ValueError — an invalid policy
+# must never silently fall back to a different security level.
+POLICIES = ("security", "preserve_rtl")
+
+
+class UndecodableFileError(ValueError):
+    """Raised when a file cannot be decoded as UTF-8.
+
+    Deliberately *not* caught by default in ``scan_file``: a file that
+    cannot be read is a scan failure, not a clean result.
+    """
+
 
 # ── Data model ─────────────────────────────────────────────────────────
 
@@ -110,6 +143,22 @@ class FileHazard:
     column: int  # 1-based
 
 
+# ── Validation ─────────────────────────────────────────────────────────
+
+
+def _validate_policy(policy: str) -> None:
+    if policy not in POLICIES:
+        raise ValueError(
+            f"invalid policy {policy!r}; expected one of {POLICIES}"
+        )
+
+
+def _require_text(text: object) -> str:
+    if not isinstance(text, str):
+        raise TypeError(f"expected str, got {type(text).__name__}")
+    return text
+
+
 # ── Detection ──────────────────────────────────────────────────────────
 
 
@@ -124,14 +173,30 @@ def _lookup(ch: str) -> Optional[Tuple[str, str, str]]:
     return None
 
 
-def find_suspicious(text: str, policy: str = "security") -> List[Hazard]:
+def find_suspicious(
+    text: str,
+    policy: str = "security",
+    limit: Optional[int] = None,
+) -> List[Hazard]:
     """Return every suspicious character in *text* as a list of :class:`Hazard`.
 
     *policy* is either ``"security"`` (default, flags everything) or
     ``"preserve_rtl"`` (ignores LRM/RLM/ZWNJ/ZWJ, which are legitimate
     for multilingual text, but still flags bidi formatting controls,
     ZWSP, BOM, and C0 control characters).
+
+    Any other *policy* value raises :class:`ValueError` — an invalid
+    policy never silently falls back to another security level.
+
+    *limit* (optional) stops scanning after *limit* hazards, bounding
+    memory for adversarial inputs. Returns at most *limit* hazards.
+
+    Raises:
+        TypeError: If *text* is not a ``str``.
+        ValueError: If *policy* is not one of :data:`POLICIES`.
     """
+    text = _require_text(text)
+    _validate_policy(policy)
     if not text:
         return []
     hazards: List[Hazard] = []
@@ -154,16 +219,20 @@ def find_suspicious(text: str, policy: str = "security") -> List[Hazard]:
                 escaped=f"U+{ord(ch):04X}",
             )
         )
+        if limit is not None and len(hazards) >= limit:
+            break
     return hazards
 
 
 def contains_bidi_controls(text: str) -> bool:
     """True if *text* contains any bidi formatting control or mark."""
+    text = _require_text(text)
     return any((cp := ord(ch)) in BIDI_FORMAT or cp in BIDI_MARK for ch in text)
 
 
 def contains_zero_width(text: str) -> bool:
     """True if *text* contains any zero-width character."""
+    text = _require_text(text)
     return any(ord(ch) in ZERO_WIDTH for ch in text)
 
 
@@ -172,10 +241,17 @@ def explain_character(ch: str) -> str:
 
     For a known hazard this is ``"U+202E RIGHT-TO-LEFT OVERRIDE (RLO)"``.
     For unknown characters it returns ``"U+0041 LATIN CAPITAL LETTER A"``
-    style output, so the function is safe to call on any input.
+    style output, so the function is safe to call on any single character.
+
+    Raises:
+        TypeError: If *ch* is not a ``str``.
+        ValueError: If *ch* is not exactly one character.
     """
-    if not ch:
-        return "(empty string)"
+    ch = _require_text(ch)
+    if len(ch) != 1:
+        raise ValueError(
+            f"expected exactly one character, got {len(ch)}"
+        )
     cp = ord(ch)
     entry = _lookup(ch)
     if entry is not None:
@@ -197,7 +273,13 @@ def sanitize(text: str, policy: str = "security") -> str:
     zero-width character, and non-whitespace C0 control is removed.
     With ``"preserve_rtl"`` LRM/RLM/ZWNJ/ZWJ are kept so legitimate
     multilingual text still renders correctly.
+
+    Raises:
+        TypeError: If *text* is not a ``str``.
+        ValueError: If *policy* is not one of :data:`POLICIES`.
     """
+    text = _require_text(text)
+    _validate_policy(policy)
     if not text:
         return text
     if policy == "preserve_rtl":
@@ -214,21 +296,47 @@ def sanitize(text: str, policy: str = "security") -> str:
 
 # ── File scanning ──────────────────────────────────────────────────────
 
-_SKIP_DIRS = {".git", ".hg", ".svn", ".venv", "venv", "__pycache__", "node_modules", ".tox", ".mypy_cache", ".pytest_cache", "dist", "build"}
+_SKIP_DIRS = {
+    ".git", ".hg", ".svn", ".venv", "venv", "__pycache__", "node_modules",
+    ".tox", ".mypy_cache", ".pytest_cache", "dist", "build",
+}
 
 
-def scan_file(path: Path, policy: str = "security") -> List[FileHazard]:
-    """Scan a single text file, returning hazards with line/column context.
+def _is_regular_file(path: Path) -> bool:
+    """True only for regular files (never FIFOs, sockets, or devices)."""
+    try:
+        return stat.S_ISREG(path.stat().st_mode)
+    except OSError:
+        return False
 
-    Files that cannot be decoded as UTF-8 are skipped (returned empty).
+
+def scan_file(
+    path: Path,
+    policy: str = "security",
+    limit: Optional[int] = None,
+) -> List[FileHazard]:
+    """Scan a single UTF-8 text file, returning hazards with line/column.
+
+    Raises:
+        ValueError: If *policy* is invalid.
+        UndecodableFileError: If the file is not valid UTF-8 (fail-closed:
+            an unreadable file is never reported as clean).
+        OSError: If the file cannot be read (missing, permissions).
     """
+    _validate_policy(policy)
+    if not _is_regular_file(path):
+        raise ValueError(f"not a regular file: {path}")
     try:
         data = path.read_text(encoding="utf-8")
-    except (UnicodeDecodeError, OSError):
-        return []
+    except UnicodeDecodeError as exc:
+        raise UndecodableFileError(
+            f"cannot decode {path} as UTF-8 ({exc.reason})"
+        ) from exc
+    except OSError:
+        raise
     results: List[FileHazard] = []
     for line_no, line in enumerate(data.splitlines(), start=1):
-        for hazard in find_suspicious(line, policy=policy):
+        for hazard in find_suspicious(line, policy=policy, limit=limit):
             results.append(
                 FileHazard(
                     hazard=hazard,
@@ -237,40 +345,94 @@ def scan_file(path: Path, policy: str = "security") -> List[FileHazard]:
                     column=hazard.offset + 1,
                 )
             )
+        if limit is not None and len(results) >= limit:
+            break
     return results
 
 
-def scan_path(path: Path, policy: str = "security", recursive: bool = False) -> List[FileHazard]:
-    """Scan a file or directory tree.
+# Callback signature: called with (path, reason) for every skipped file.
+SkipCallback = Callable[[str, str], None]
 
-    When *path* is a directory and *recursive* is True the directory is
-    walked (skipping VCS, virtualenv, and cache directories).
 
-    Symlinked files and directories are **never** followed during a tree
-    scan, so a tree can never pull in content from outside its root.
+def _scan_single(
+    path: Path,
+    policy: str,
+    limit: Optional[int],
+    on_skip: Optional[SkipCallback],
+) -> Iterator[FileHazard]:
+    if not _is_regular_file(path):
+        if on_skip is not None:
+            on_skip(str(path), "not a regular file (FIFO/socket/device)")
+        return
+    try:
+        data = path.read_text(encoding="utf-8")
+    except UnicodeDecodeError as exc:
+        if on_skip is not None:
+            on_skip(str(path), f"not valid UTF-8 ({exc.reason})")
+        return
+    except OSError as exc:
+        if on_skip is not None:
+            on_skip(str(path), f"cannot read ({exc.strerror or exc})")
+        return
+    count = 0
+    for line_no, line in enumerate(data.splitlines(), start=1):
+        for hazard in find_suspicious(line, policy=policy):
+            yield FileHazard(
+                hazard=hazard,
+                path=str(path),
+                line=line_no,
+                column=hazard.offset + 1,
+            )
+            count += 1
+            if limit is not None and count >= limit:
+                return
+
+
+def scan_path_iter(
+    path: Path,
+    policy: str = "security",
+    recursive: bool = False,
+    limit: Optional[int] = None,
+    on_skip: Optional[SkipCallback] = None,
+) -> Iterator[FileHazard]:
+    """Yield hazards from a file or directory tree (streaming).
+
+    Unlike :func:`scan_path`, this is a generator: hazards are yielded as
+    they are found, so memory stays bounded even for trees with millions
+    of findings.
+
+    Files that cannot be examined (non-UTF-8, unreadable, special files)
+    are *not* silently treated as clean — they are reported via
+    *on_skip(path, reason)*. If *on_skip* is ``None`` they are skipped
+    silently (streaming callers should pass a collector).
 
     Raises:
-        OSError: If *path* does not exist or is not readable as a
-            directory (so a mistyped path fails loudly instead of
-            reporting a false "clean").
+        OSError: If *path* does not exist or is not a readable directory
+            (so a mistyped path fails loudly instead of yielding nothing).
     """
-    if path.is_file():
-        return scan_file(path, policy=policy)
-    if not path.is_dir():
-        raise OSError(f"cannot scan {path}: no such directory")
-    results: List[FileHazard] = []
+    _validate_policy(policy)
+    p = Path(path)
+    if p.is_file():
+        yield from _scan_single(p, policy, limit, on_skip)
+        return
+    if not p.is_dir():
+        raise OSError(f"cannot scan {p}: no such directory")
     if not recursive:
         try:
-            children = sorted(path.iterdir())
+            children = sorted(p.iterdir())
         except OSError as exc:
-            raise OSError(f"cannot list directory {path}: {exc}") from exc
+            raise OSError(f"cannot list directory {p}: {exc}") from exc
         for child in children:
             if child.is_symlink():
                 continue  # never follow symlinks outside the scan root
-            if child.is_file():
-                results.extend(scan_file(child, policy=policy))
-        return results
-    for root, dirs, files in os.walk(path, followlinks=False):
+            yield from _scan_single(child, policy, limit, on_skip)
+        return
+
+    def _on_walk_error(exc: OSError) -> None:
+        if on_skip is not None:
+            on_skip(str(getattr(exc, "filename", "?")), "cannot read directory")
+
+    for root, dirs, files in os.walk(p, followlinks=False, onerror=_on_walk_error):
         dirs[:] = [
             d
             for d in dirs
@@ -280,12 +442,37 @@ def scan_path(path: Path, policy: str = "security", recursive: bool = False) -> 
             fp = Path(root) / name
             if fp.is_symlink():
                 continue
-            results.extend(scan_file(fp, policy=policy))
-    return results
+            yield from _scan_single(fp, policy, limit, on_skip)
 
 
-def scan_texts(texts: Iterable[str], policy: str = "security") -> List[Hazard]:
-    """Convenience: scan an iterable of strings, returning flat hazards."""
+def scan_path(
+    path: Path,
+    policy: str = "security",
+    recursive: bool = False,
+    limit: Optional[int] = None,
+) -> List[FileHazard]:
+    """Scan a file or directory tree, returning the full list of hazards.
+
+    Convenience wrapper around :func:`scan_path_iter` for callers that
+    want the complete result in memory. For large or adversarial inputs
+    prefer the streaming iterator.
+
+    Raises:
+        OSError: If *path* does not exist or is not a readable directory.
+    """
+    return list(scan_path_iter(path, policy=policy, recursive=recursive, limit=limit))
+
+
+def scan_texts(
+    texts: Iterable[str],
+    policy: str = "security",
+) -> List[Hazard]:
+    """Convenience: scan an iterable of strings, returning flat hazards.
+
+    Raises:
+        ValueError: If *policy* is invalid.
+    """
+    _validate_policy(policy)
     out: List[Hazard] = []
     for text in texts:
         out.extend(find_suspicious(text, policy=policy))
