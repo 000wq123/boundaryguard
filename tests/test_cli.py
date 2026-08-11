@@ -128,6 +128,17 @@ class TestSanitize:
         assert src.read_text(encoding="utf-8") == "ab"
         assert (src.stat().st_mode & 0o777) == 0o640
 
+    def test_sanitize_samefile_output_is_in_place(self, tmp_path: Path):
+        # `-o` spelled as a different path to the same inode is still an
+        # in-place edit: permissions must be preserved, not reset.
+        src = tmp_path / "in.txt"
+        src.write_text(f"a{RLO}b", encoding="utf-8")
+        src.chmod(0o640)
+        r = run_cli("sanitize", str(src), "-o", str(src.resolve()))
+        assert r.returncode == 0
+        assert src.read_text(encoding="utf-8") == "ab"
+        assert (src.stat().st_mode & 0o777) == 0o640
+
     def test_sanitize_refuses_symlink_input(self, tmp_path: Path):
         # In-place sanitize of a symlink would modify the target outside
         # the intended location — refuse instead.

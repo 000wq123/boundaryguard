@@ -26,7 +26,7 @@ import stat
 import sys
 import tempfile
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional
 
 from . import __version__
 from .core import (
@@ -198,10 +198,15 @@ def cmd_sanitize(args: argparse.Namespace) -> int:
         )
         return 2
     # "In place" means the same file (same path or same inode); anything
-    # else is a new output file.
-    in_place = out == src or (
-        src.exists() and out.exists() and os.path.samefile(src, out)
-    )
+    # else is a new output file. samefile can raise OSError on some
+    # filesystems even when both paths exist, so treat that as "not in
+    # place" rather than crashing.
+    in_place = out == src
+    if not in_place:
+        try:
+            in_place = out.exists() and os.path.samefile(src, out)
+        except OSError:
+            in_place = False
     # Atomic write: temp file in the same directory, then rename. A failed
     # or interrupted write can never leave a partially rewritten file.
     tmp_path: Optional[str] = None
@@ -219,6 +224,9 @@ def cmd_sanitize(args: argparse.Namespace) -> int:
         else:
             # New output file: respect the umask like a normal open would
             # (mkstemp defaults to 0600, which is unexpectedly private).
+            # os.umask() is the only way to read the umask; the read-back
+            # restores it immediately, so the process-global change is
+            # transient and safe for this single-threaded CLI.
             umask = os.umask(0)
             os.umask(umask)
             os.chmod(tmp_path, 0o666 & ~umask)
