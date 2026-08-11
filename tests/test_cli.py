@@ -167,6 +167,36 @@ class TestSanitize:
         assert not out.exists()  # nothing partially written
 
 
+class TestFailClosedPrecedence:
+    def test_check_findings_and_skips_exit_two(self, tmp_path: Path):
+        # Hazards found AND a file that could not be scanned -> exit 2
+        # (fail-closed: the result is incomplete, so it is not a clean pass
+        # and not a plain "findings" verdict either).
+        dirty = tmp_path / "dirty.py"
+        dirty.write_text(f"x = '{RLO}'\n", encoding="utf-8")
+        nonutf8 = tmp_path / "evil16.txt"
+        nonutf8.write_bytes(b"\xff\xfe" + f"A{RLO}B".encode("utf-16-le"))
+        r = run_cli("check", "--recursive", str(tmp_path))
+        assert r.returncode == 2
+        assert "could not be scanned" in r.stderr
+        assert "hazard" in r.stdout.lower()
+
+    def test_sanitize_output_respects_umask(self, tmp_path: Path):
+        # New output files must be umask-respecting (not mkstemp's 0600).
+        import os
+
+        src = tmp_path / "in.txt"
+        src.write_text(f"a{RLO}b", encoding="utf-8")
+        out = tmp_path / "out.txt"
+        old_umask = os.umask(0o022)
+        try:
+            r = run_cli("sanitize", str(src), "-o", str(out))
+        finally:
+            os.umask(old_umask)
+        assert r.returncode == 0
+        assert (out.stat().st_mode & 0o777) == 0o644
+
+
 class TestBrokenPipe:
     def test_scan_broken_pipe_no_traceback(self, tmp_path: Path):
         # `boundaryguard scan | head -1` must die quietly, not traceback.

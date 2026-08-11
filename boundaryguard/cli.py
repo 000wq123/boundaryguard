@@ -197,6 +197,11 @@ def cmd_sanitize(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # "In place" means the same file (same path or same inode); anything
+    # else is a new output file.
+    in_place = out == src or (
+        src.exists() and out.exists() and os.path.samefile(src, out)
+    )
     # Atomic write: temp file in the same directory, then rename. A failed
     # or interrupted write can never leave a partially rewritten file.
     tmp_path: Optional[str] = None
@@ -208,9 +213,15 @@ def cmd_sanitize(args: argparse.Namespace) -> int:
         )
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(clean)
-        if out == src:
+        if in_place:
             # Preserve the original file's permissions for in-place edits.
             os.chmod(tmp_path, stat.S_IMODE(src.stat().st_mode))
+        else:
+            # New output file: respect the umask like a normal open would
+            # (mkstemp defaults to 0600, which is unexpectedly private).
+            umask = os.umask(0)
+            os.umask(umask)
+            os.chmod(tmp_path, 0o666 & ~umask)
         os.replace(tmp_path, out)
     except OSError as exc:
         print(f"error: cannot write {out}: {exc}", file=sys.stderr)
@@ -282,6 +293,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     except KeyboardInterrupt:
         return 130
     except BrokenPipeError:
+        # Avoid a secondary BrokenPipeError when the interpreter flushes
+        # stdout at shutdown (matters on platforms without SIGPIPE).
+        try:
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, sys.stdout.fileno())
+        except OSError:
+            pass
         return 141
 
 

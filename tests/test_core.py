@@ -261,6 +261,18 @@ class TestFileScanning:
         found = list(scan_path_iter(tmp_path, recursive=True, limit=50))
         assert len(found) == 50
 
+    def test_scan_path_reports_skips_via_callback(self, tmp_path: Path):
+        # scan_path must not silently fail open: skips are observable.
+        f = tmp_path / "evil16.txt"
+        f.write_bytes(b"\xff\xfe" + f"A{RLO}B".encode("utf-16-le"))
+        skips = []
+        found = scan_path(
+            tmp_path, recursive=True, on_skip=lambda p, r: skips.append((p, r))
+        )
+        assert found == []
+        assert len(skips) == 1
+        assert "evil16.txt" in skips[0][0]
+
     def test_scan_path_skips_symlinked_files(self, tmp_path: Path):
         # A symlink inside the tree must not pull in content from outside.
         outside = tmp_path / "outside"

@@ -86,7 +86,7 @@ Drop `boundaryguard check --recursive .` into your CI and never merge invisible 
 
   If your tree legitimately contains binary files, exclude them (e.g. scan `src/` only) rather than letting an unexamined file silently pass.
 - **Streaming scans** — `scan`/`check` stream findings as they are found, so memory stays bounded even on adversarial trees with millions of hazards.
-- **Atomic sanitize** — `sanitize` writes to a temp file in the same directory and renames it into place; a failed or interrupted write can never leave a partially rewritten file. In-place edits preserve the original file's permissions.
+- **Atomic sanitize** — `sanitize` writes to a temp file in the same directory and renames it into place; a failed or interrupted write can never leave a partially rewritten file. In-place edits preserve the original file's permissions. (As with `sed -i`, the replacement is a fresh inode, so ownership and hard links are not preserved — the file ends up owned by the current user.)
 - **Sanitize refuses symlinks** — `sanitize` on a symlinked input (or `-o` pointing at a symlink) exits `2` rather than silently modifying the symlink's target.
 
 ---

@@ -416,6 +416,11 @@ def scan_path_iter(
         yield from _scan_single(p, policy, limit, on_skip)
         return
     if not p.is_dir():
+        if p.exists():
+            raise OSError(
+                f"cannot scan {p}: not a regular file or directory "
+                "(FIFO/socket/device)"
+            )
         raise OSError(f"cannot scan {p}: no such directory")
     if not recursive:
         try:
@@ -450,6 +455,7 @@ def scan_path(
     policy: str = "security",
     recursive: bool = False,
     limit: Optional[int] = None,
+    on_skip: Optional[SkipCallback] = None,
 ) -> List[FileHazard]:
     """Scan a file or directory tree, returning the full list of hazards.
 
@@ -457,10 +463,21 @@ def scan_path(
     want the complete result in memory. For large or adversarial inputs
     prefer the streaming iterator.
 
+    Fail-closed note: files that cannot be examined (non-UTF-8,
+    unreadable, special files) are **not** reported as clean — they are
+    dropped from the result. Pass *on_skip* to observe them; without it
+    they are skipped silently, so callers that need a verified-clean
+    answer should always provide an *on_skip* callback and treat any skip
+    as "could not verify".
+
     Raises:
         OSError: If *path* does not exist or is not a readable directory.
     """
-    return list(scan_path_iter(path, policy=policy, recursive=recursive, limit=limit))
+    return list(
+        scan_path_iter(
+            path, policy=policy, recursive=recursive, limit=limit, on_skip=on_skip
+        )
+    )
 
 
 def scan_texts(
