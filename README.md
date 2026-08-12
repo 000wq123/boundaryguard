@@ -174,7 +174,7 @@ Unicode bidi and zero-width characters aren't inherently malicious — they're r
 - `trojan_early_return.py` — LRE/PDF early-return variant
 - `legitimate_rtl.txt` — legitimate Arabic text that must pass under `preserve_rtl`
 
-The CI pipeline runs the full suite on Python 3.9–3.12 **and** self-scans the library source with `boundaryguard check` (dogfooding).
+The CI pipeline runs the full suite on Python 3.9–3.12 **and** self-scans the library source with `boundaryguard check` (dogfooding) **and** runs a mutation suite (`scripts/mutation_test.py`) that surgically removes each security guard in a sandboxed copy of the source and requires the test suite to catch every removal. If a future change silently drops fail-closed decoding, symlink refusal, terminal escaping, or any of the other guards, the mutation job fails — the tests are proven to be sensitive to the exact behaviors they claim to protect.
 
 ---
 
@@ -188,6 +188,7 @@ The CI pipeline runs the full suite on Python 3.9–3.12 **and** self-scans the 
 - [x] Streaming file input (1 MiB chunks; multi-GB files use bounded RAM)
 - [x] Terminal-safe output (untrusted paths rendered with visible escapes)
 - [x] Race-proof tree scans (`O_NOFOLLOW` where available)
+- [x] **Mutation testing for the security guards** (`scripts/mutation_test.py`, wired into CI) — 14 mutants, one per guard; the suite must kill every one
 - [ ] JSON / SARIF output for CI integrations
 - [ ] **Path-component scanning** — flag invisible-Unicode in *filenames* themselves (e.g. `auth\u202Eyp.exe`). Deliberately out of scope for now: the CLI already renders such names safely, and GitHub/other surfaces have their own handling; needs a distinct finding type and CI-semantics decision.
 - [ ] Windows CI coverage — junctions/reparse points and reserved names are not exercised by the (Linux) test matrix; `O_NOFOLLOW` is unavailable on Windows so tree scans there fall back to check-then-open.
