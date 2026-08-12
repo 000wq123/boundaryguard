@@ -1,0 +1,6 @@
+# Make the sdist the complete repository, not just the package:
+# the pre-commit manifest is the hook's entry point, the mutation suite
+# is the security gate, and the CI workflow proves both run.
+include .pre-commit-hooks.yaml
+recursive-include scripts *.py
+recursive-include .github *
