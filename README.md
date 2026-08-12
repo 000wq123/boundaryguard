@@ -159,7 +159,7 @@ Unicode bidi and zero-width characters aren't inherently malicious — they're r
 | Category | Characters | Why it matters |
 |----------|-----------|----------------|
 | `bidi_format` | LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI, and the deprecated ISS/ASS/IAFS/AFS/NDS/NODS (U+202A–U+202E, U+2066–U+206F) | **Trojan Source (CVE-2021-42574)** — text renders in a different order from its logical order |
-| `bidi_mark` | ALM, LRM, RLM (U+061C, U+200E–U+200F) | Invisible bidi marks (the full `Bidi_Control=Yes` mark set, including U+061C ARABIC LETTER MARK — the only Bidi_Control the industry bidi set adds beyond U+200E–U+202E); abused for obfuscation, legitimate for RTL text |
+| `bidi_mark` | ALM, LRM, RLM (U+061C, U+200E–U+200F) | Invisible bidi marks — the complete `Bidi_Control=Yes` mark set. U+061C ARABIC LETTER MARK was the only Bidi_Control character boundaryguard previously missed (it is the Arabic counterpart of LRM/RLM); abused for obfuscation, legitimate for RTL text |
 | `zero_width` | ZWSP, ZWNJ, ZWJ, WORD JOINER, BOM (U+200B–U+200D, U+2060, U+FEFF) | Invisible to humans, meaningful to machines; break comparisons and hide content |
 | `control` | C0 controls except `\t\n\r` | Non-printing bytes that corrupt logs, terminals, and parsers |
 
