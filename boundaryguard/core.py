@@ -10,7 +10,7 @@ abused for deception:
   human reviewer can approve code that does something other than what it
   looks like.
 
-* **Bidi marks** (LRM/RLM) — harmless on their own and *required* for
+* **Bidi marks** (ALM/LRM/RLM) — harmless on their own and *required* for
   correct rendering of mixed left-to-right/right-to-left text, but they
   are invisible and frequently abused for obfuscation in logs, prompts,
   and provenance strings.
@@ -79,6 +79,12 @@ BIDI_FORMAT = {
 }
 
 BIDI_MARK = {
+    # U+061C ARABIC LETTER MARK: one of the 13 characters with
+    # Bidi_Control=Yes (category Cf, bidi class AL) — the Arabic
+    # counterpart of LRM/RLM. Like them it is invisible, default-ignorable,
+    # and machine-significant (it steers the bidi algorithm and breaks
+    # string comparisons), so it belongs in the same hazard class.
+    0x061C: ("ALM", "ARABIC LETTER MARK", "bidi_mark"),
     0x200E: ("LRM", "LEFT-TO-RIGHT MARK", "bidi_mark"),
     0x200F: ("RLM", "RIGHT-TO-LEFT MARK", "bidi_mark"),
 }
@@ -96,7 +102,7 @@ ZERO_WIDTH = {
 
 # Characters preserved under the "preserve_rtl" policy: required for
 # legitimate Arabic/Hebrew/Persian/Urdu text rendering and script joining.
-_PRESERVE_RTL = {0x200E, 0x200F, 0x200C, 0x200D}
+_PRESERVE_RTL = {0x061C, 0x200E, 0x200F, 0x200C, 0x200D}
 
 # C0 control characters except the common whitespace \t \n \r.
 _C0_EXCEPT_WS = frozenset(chr(c) for c in range(0x20) if c not in (0x09, 0x0A, 0x0D))

@@ -100,6 +100,13 @@ class TestPolicies:
         # …but still flags the dangerous formatting controls.
         assert find_suspicious(f"x{RLO}y", policy="preserve_rtl") != []
 
+    def test_preserve_rtl_keeps_alm(self):
+        # U+061C ARABIC LETTER MARK is the Arabic bidi mark; preserve_rtl
+        # must keep it exactly like LRM/RLM.
+        text = "\u0645\u0631\u062d\u0628\u0627\u061c"  # مرحبا + ALM
+        assert sanitize(text, policy="preserve_rtl") == text
+        assert find_suspicious(text, policy="preserve_rtl") == []
+
 
 class TestSanitize:
     def test_strips_all_by_default(self):
@@ -175,6 +182,18 @@ class TestApiContract:
         assert hazards[0].category == "bidi_format"
         assert hazards[0].short == "ISS"
 
+    def test_alm_is_bidi_control_detected(self):
+        # U+061C ARABIC LETTER MARK is one of the 13 characters with
+        # Bidi_Control=Yes (category Cf, bidi class AL) — every bidi
+        # control must be flagged. Regression: ALM was the only gap in the
+        # Bidi_Control set.
+        hazards = find_suspicious("a\u061cb")
+        assert len(hazards) == 1
+        assert hazards[0].short == "ALM"
+        assert hazards[0].category == "bidi_mark"
+        assert sanitize("a\u061cb") == "ab"
+        assert contains_bidi_controls("\u061c")
+
     def test_get_type_hints_works_on_all_public_functions(self):
         import typing
 
@@ -209,6 +228,17 @@ class TestFileScanning:
         f.write_bytes(b"\xff\xfe" + "HELLO\u202eSECRET".encode("utf-16-le"))
         with pytest.raises(UndecodableFileError):
             scan_file(f)
+
+    def test_scan_file_flags_alm(self, tmp_path: Path):
+        # U+061C in file content is a bidi control and must be reported
+        # with correct line/column through the streaming scanner.
+        f = tmp_path / "arabic.py"
+        f.write_text("x = 'a\u061cb'\n", encoding="utf-8")
+        results = scan_file(f)
+        assert len(results) == 1
+        assert results[0].hazard.short == "ALM"
+        assert results[0].line == 1
+        assert results[0].column == 7
 
     def test_scan_file_raises_on_special_file(self, tmp_path: Path):
         # Run in a thread with a timeout so that a regression which opens

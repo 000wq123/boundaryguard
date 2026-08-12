@@ -144,7 +144,7 @@ wrapper that returns the complete list in memory.
 
 Unicode bidi and zero-width characters aren't inherently malicious — they're required for legitimate multilingual text. boundaryguard ships two policies so you can be strict where it matters and permissive where it doesn't.
 
-| Policy | Bidi formatting controls | Bidi marks (LRM/RLM) | ZWSP / BOM | ZWNJ / ZWJ | C0 controls |
+| Policy | Bidi formatting controls | Bidi marks (ALM/LRM/RLM) | ZWSP / BOM | ZWNJ / ZWJ | C0 controls |
 |--------|------------------------|---------------------|------------|------------|-------------|
 | `security` (default) | strip | strip | strip | strip | strip |
 | `preserve_rtl` | strip | **keep** | strip | **keep** | strip |
@@ -159,7 +159,7 @@ Unicode bidi and zero-width characters aren't inherently malicious — they're r
 | Category | Characters | Why it matters |
 |----------|-----------|----------------|
 | `bidi_format` | LRE, RLE, PDF, LRO, RLO, LRI, RLI, FSI, PDI, and the deprecated ISS/ASS/IAFS/AFS/NDS/NODS (U+202A–U+202E, U+2066–U+206F) | **Trojan Source (CVE-2021-42574)** — text renders in a different order from its logical order |
-| `bidi_mark` | LRM, RLM (U+200E–U+200F) | Invisible; abused for obfuscation, legitimate for RTL text |
+| `bidi_mark` | ALM, LRM, RLM (U+061C, U+200E–U+200F) | Invisible bidi marks (the full `Bidi_Control=Yes` mark set, including U+061C ARABIC LETTER MARK — the only Bidi_Control the industry bidi set adds beyond U+200E–U+202E); abused for obfuscation, legitimate for RTL text |
 | `zero_width` | ZWSP, ZWNJ, ZWJ, WORD JOINER, BOM (U+200B–U+200D, U+2060, U+FEFF) | Invisible to humans, meaningful to machines; break comparisons and hide content |
 | `control` | C0 controls except `\t\n\r` | Non-printing bytes that corrupt logs, terminals, and parsers |
 
@@ -174,7 +174,7 @@ Unicode bidi and zero-width characters aren't inherently malicious — they're r
 - `trojan_early_return.py` — LRE/PDF early-return variant
 - `legitimate_rtl.txt` — legitimate Arabic text that must pass under `preserve_rtl`
 
-The CI pipeline runs the full suite on Python 3.9–3.12 **and** self-scans the library source with `boundaryguard check` (dogfooding) **and** runs a mutation suite (`scripts/mutation_test.py`) that surgically removes each security guard in a sandboxed copy of the source and requires the test suite to catch every removal. If a future change silently drops fail-closed decoding, symlink refusal, terminal escaping, or any of the other guards, the mutation job fails — the tests are proven to be sensitive to the exact behaviors they claim to protect.
+The CI pipeline runs the full suite on Python 3.9–3.12 **and** self-scans the library source with `boundaryguard check` (dogfooding) **and** runs a mutation suite (`scripts/mutation_test.py`) that surgically removes each security guard in a sandboxed copy of the source and requires the test suite to catch every removal (15 mutants, one per guard). If a future change silently drops fail-closed decoding, symlink refusal, terminal escaping, or any of the other guards, the mutation job fails — the tests are proven to be sensitive to the exact behaviors they claim to protect.
 
 ---
 
@@ -188,7 +188,7 @@ The CI pipeline runs the full suite on Python 3.9–3.12 **and** self-scans the 
 - [x] Streaming file input (1 MiB chunks; multi-GB files use bounded RAM)
 - [x] Terminal-safe output (untrusted paths rendered with visible escapes)
 - [x] Race-proof tree scans (`O_NOFOLLOW` where available)
-- [x] **Mutation testing for the security guards** (`scripts/mutation_test.py`, wired into CI) — 14 mutants, one per guard; the suite must kill every one
+- [x] **Mutation testing for the security guards** (`scripts/mutation_test.py`, wired into CI) — 15 mutants, one per guard; the suite must kill every one
 - [ ] JSON / SARIF output for CI integrations
 - [ ] **Path-component scanning** — flag invisible-Unicode in *filenames* themselves (e.g. `auth\u202Eyp.exe`). Deliberately out of scope for now: the CLI already renders such names safely, and GitHub/other surfaces have their own handling; needs a distinct finding type and CI-semantics decision.
 - [ ] Windows CI coverage — junctions/reparse points and reserved names are not exercised by the (Linux) test matrix; `O_NOFOLLOW` is unavailable on Windows so tree scans there fall back to check-then-open.

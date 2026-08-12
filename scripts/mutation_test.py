@@ -8,7 +8,7 @@ for every mutant: if it passes, that guard has no test coverage and a
 future change could silently drop it without CI noticing.
 
 Why a manual mutant set instead of mutmut?
-    - Deterministic and fast (~20s): every mutant is a single logical
+    - Deterministic and fast (~22s): every mutant is a single logical
       guard removal, and each run exercises the whole suite once.
     - Targeted: every mutant here maps to a real security guarantee
       (fail-closed decoding, symlink refusal, terminal escaping, ...)
@@ -117,10 +117,11 @@ MUTANTS: List[Dict[str, object]] = [
         "path": "boundaryguard/core.py",
         "guard": "preserve_rtl must keep LRM/RLM/ZWNJ/ZWJ (legitimate RTL text)",
         "replacements": [
-            ("_PRESERVE_RTL = {0x200E, 0x200F, 0x200C, 0x200D}\n", "_PRESERVE_RTL = set()\n"),
+            ("_PRESERVE_RTL = {0x061C, 0x200E, 0x200F, 0x200C, 0x200D}\n", "_PRESERVE_RTL = set()\n"),
         ],
-        "killed_by": "test_preserve_rtl_keeps_legitimate_marks + "
-        "test_find_suspicious_preserve_rtl_ignores_legitimate_marks",
+        "killed_by": "test_preserve_rtl_keeps_legitimate_marks, "
+        "test_find_suspicious_preserve_rtl_ignores_legitimate_marks, "
+        "test_preserve_rtl_keeps_alm",
     },
     {
         "id": "M4",
@@ -310,6 +311,16 @@ MUTANTS: List[Dict[str, object]] = [
             ),
         ],
         "killed_by": "test_check_empty_path_exit_two",
+    },
+    {
+        "id": "M15",
+        "path": "boundaryguard/core.py",
+        "guard": "character tables: U+061C ARABIC LETTER MARK (a Bidi_Control) must be detected",
+        "replacements": [
+            ('    0x061C: ("ALM", "ARABIC LETTER MARK", "bidi_mark"),\n', ""),
+        ],
+        "killed_by": "test_alm_is_bidi_control_detected, "
+        "test_scan_file_flags_alm, test_preserve_rtl_keeps_alm",
     },
 ]
 
