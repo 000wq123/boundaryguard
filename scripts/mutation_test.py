@@ -8,7 +8,7 @@ for every mutant: if it passes, that guard has no test coverage and a
 future change could silently drop it without CI noticing.
 
 Why a manual mutant set instead of mutmut?
-    - Deterministic and fast (~15s): every mutant is a single logical
+    - Deterministic and fast (~20s): every mutant is a single logical
       guard removal, and each run exercises the whole suite once.
     - Targeted: every mutant here maps to a real security guarantee
       (fail-closed decoding, symlink refusal, terminal escaping, ...)
@@ -17,7 +17,26 @@ Why a manual mutant set instead of mutmut?
     - Zero dependencies beyond pytest (matches the project's zero-dep
       ethos); no install step, no network, no flaky timeouts.
 
-Known non-mutants (guards that are deliberately NOT in this set):
+How kills are judged
+--------------------
+Before any mutant runs, the pristine sandbox is tested once as a control:
+if the unmutated suite does not pass in the sandbox, the entire run is
+invalid and aborts — the gate can never report "all killed" without first
+proving the base suite is green in the same environment.
+
+Per mutant, pytest's exit code decides the status:
+
+* ``KILLED``    — exit 1: tests ran and assertions failed (a genuine kill).
+* ``SURVIVED``  — exit 0: the suite passed with the guard removed (gap).
+* ``ERRORED``   — any other non-zero exit (2/3/4/5, no test summary):
+                  tests could not run, so nothing was demonstrated. Treated
+                  as a failure of the gate, never as a kill.
+* ``HUNG``      — the per-mutant timeout fired; the guard removal made the
+                  suite hang (e.g. a FIFO opened and read forever). Also a
+                  failure: the guard was load-bearing and the suite cannot
+                  even fail on it.
+
+Known non-mutants (guards deliberately NOT in this set):
     - Atomic sanitize writes (``os.replace``): not deterministically
       testable in a unit suite without fault injection; covered by the
       crash-consistency audit (SIGKILL at every stage, 0 corruptions).
@@ -28,8 +47,8 @@ Known non-mutants (guards that are deliberately NOT in this set):
       combined with the symlink-refusal mutant (M6).
 
 Exit codes:
-    0  — every mutant was killed by the suite
-    1  — at least one mutant survived (suite passed) or hung (timeout)
+    0  — every mutant was killed by the suite (control passed)
+    1  — a mutant survived, errored, or hung; or the control failed
 
 Usage:
     python scripts/mutation_test.py           # run the full set
@@ -39,13 +58,14 @@ Usage:
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import time
 from pathlib import Path
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -315,12 +335,13 @@ def _apply_mutation(source: str, replacements: List[Tuple[str, str]]) -> str:
     return source
 
 
-def _run_pytest_in_sandbox(mut: Dict[str, object]) -> Tuple[int, str]:
-    """Copy the source+tests into a temp dir, apply the mutation, run pytest.
+def _run_in_sandbox(mut: Optional[Dict[str, object]]) -> Tuple[int, str]:
+    """Copy the source+tests into a temp dir, optionally mutate, run pytest.
 
     ``cwd`` and ``PYTHONPATH`` both point at the sandbox so every test —
     including the subprocess-based CLI tests — imports the *mutated*
-    package, never an installed copy.
+    package, never an installed or editable copy. ``mut=None`` runs the
+    pristine copy (the control).
     """
     with tempfile.TemporaryDirectory(prefix="bg-mutation-") as td:
         sandbox = Path(td)
@@ -331,14 +352,19 @@ def _run_pytest_in_sandbox(mut: Dict[str, object]) -> Tuple[int, str]:
                 shutil.copytree(src, dst, ignore=_IGNORE)
             else:
                 shutil.copy2(src, dst)
-        target = sandbox / str(mut["path"])
-        text = target.read_text(encoding="utf-8")
-        text = _apply_mutation(text, list(mut["replacements"]))  # type: ignore[arg-type]
-        target.write_text(text, encoding="utf-8")
+        if mut is not None:
+            target = sandbox / str(mut["path"])
+            text = target.read_text(encoding="utf-8")
+            text = _apply_mutation(text, list(mut["replacements"]))  # type: ignore[arg-type]
+            target.write_text(text, encoding="utf-8")
         env = dict(os.environ)
         env["PYTHONPATH"] = str(sandbox) + os.pathsep + env.get("PYTHONPATH", "")
         proc = subprocess.run(
-            [sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
+            # No -q here: the copied pyproject.toml already adds it via
+            # addopts, and two -q flags (quiet-quiet) suppress pytest's
+            # "N passed" summary line, which the control uses to verify
+            # the expected test count actually ran.
+            [sys.executable, "-m", "pytest", "-p", "no:cacheprovider"],
             cwd=sandbox,
             env=env,
             capture_output=True,
@@ -360,40 +386,70 @@ def _check_pytest_available() -> None:
         )
 
 
+def _status_for(returncode: int) -> str:
+    """Map a pytest exit code to a status.
+
+    Only exit 1 (tests ran and failed) is a genuine kill. Exit 0 is a
+    survival. Anything else (2/3/4/5: collection, usage, or internal
+    errors) means the tests could not run, so nothing was demonstrated.
+    """
+    if returncode == 0:
+        return "SURVIVED"
+    if returncode == 1:
+        return "KILLED"
+    return "ERRORED"
+
+
 def main(argv: List[str]) -> int:
     _check_pytest_available()
     subset = set(argv[1:])
-    results: List[Tuple[Dict[str, object], str, float, str]] = []
     print("Mutation testing: boundaryguard security guards")
     print("=" * 56)
+
+    # Control run: the pristine sandbox must pass, or the run is invalid.
+    print("  control: verifying the pristine suite passes in the sandbox...")
+    control_rc, control_out = _run_in_sandbox(None)
+    if control_rc != 0:
+        print("  control FAILED — the mutation run is invalid (broken sandbox/base suite).")
+        for line in control_out.strip().splitlines()[-8:]:
+            print(f"    | {line}")
+        return 1
+    m = re.search(r"(\d+) passed", control_out)
+    print(f"  control passed ({m.group(1)} tests)." if m else "  control passed.")
+
+    results: List[Tuple[Dict[str, object], str, float, str]] = []
     for mut in MUTANTS:
         if subset and mut["id"] not in subset:
             continue
         start = time.monotonic()
         try:
-            returncode, output = _run_pytest_in_sandbox(mut)
-            elapsed = time.monotonic() - start
-            if returncode == 0:
-                status = "SURVIVED"
-            else:
-                status = "KILLED"
-        except subprocess.TimeoutExpired:
-            elapsed = time.monotonic() - start
+            returncode, output = _run_in_sandbox(mut)
+            status = _status_for(returncode)
+        except subprocess.TimeoutExpired as exc:
             status = "HUNG"
-            output = ""
+            output = getattr(exc, "output", "") or ""
+        elapsed = time.monotonic() - start
         results.append((mut, status, elapsed, output))
         print(f"  {mut['id']:<4} {status:<9} {elapsed:5.1f}s  {mut['guard']}")
 
     killed = sum(1 for _, s, _, _ in results if s == "KILLED")
-    failed = [(m, s, out) for m, s, _, out in results if s != "KILLED"]
+    failed = [(m_, s, out) for m_, s, _, out in results if s != "KILLED"]
     print("=" * 56)
     if not failed:
-        print(f"{killed}/{len(results)} mutants killed. All security guards are covered by tests.")
+        print(
+            f"{killed}/{len(results)} mutants killed. "
+            "All security guards are covered by tests."
+        )
         return 0
-    print(f"{killed}/{len(results)} killed, {len(failed)} NOT killed — the suite is not protecting:")
+    print(
+        f"{killed}/{len(results)} killed, {len(failed)} NOT killed — "
+        "the suite is not protecting:"
+    )
     for mut, status, output in failed:
         print(f"\n  {mut['id']} {status}: {mut['guard']}")
         print(f"    expected killed by: {mut['killed_by']}")
+        if status == "HUNG":
+            print("    the suite hung after this guard was removed (timeout).")
         tail = output.strip().splitlines()[-8:]
         for line in tail:
             print(f"    | {line}")
