@@ -1,5 +1,6 @@
 """CLI tests for boundaryguard (subprocess level)."""
 
+import json
 import os
 import subprocess
 import sys
@@ -269,3 +270,169 @@ class TestBrokenPipe:
         err = proc.stderr.read() if proc.stderr else ""
         assert "Traceback" not in err
         assert "BrokenPipeError" not in err
+
+
+class TestMachineFormats:
+    """JSON and SARIF output must be valid documents that carry the same
+    fail-closed semantics as text mode."""
+
+    def test_scan_json_findings(self, tmp_path: Path):
+        f = tmp_path / "sample.py"
+        f.write_text(f"a = 1\nb = '{RLI} {PDI}'\n", encoding="utf-8")
+        r = run_cli("scan", "--format", "json", str(f))
+        assert r.returncode == 1
+        doc = json.loads(r.stdout)
+        assert doc["schemaVersion"] == "1.0"
+        assert doc["policy"] == "security"
+        assert len(doc["findings"]) == 2
+        assert doc["findings"][0]["path"] == str(f)
+        assert doc["findings"][0]["line"] == 2
+        assert doc["findings"][0]["category"] == "bidi_format"
+        assert doc["skipped"] == []
+        assert doc["error"] is None
+
+    def test_scan_json_clean(self, tmp_path: Path):
+        f = tmp_path / "clean.py"
+        f.write_text("print('safe')\n", encoding="utf-8")
+        r = run_cli("scan", "--format", "json", str(f))
+        assert r.returncode == 0
+        doc = json.loads(r.stdout)
+        assert doc["findings"] == []
+
+    def test_scan_json_hostile_filename_keeps_document_valid(self, tmp_path: Path):
+        # A filename containing a newline, ESC, and a bidi char must not
+        # corrupt the JSON document, and must round-trip exactly when parsed.
+        evil = f"evil{RLO}\n\x1b[31mname"
+        f = tmp_path / evil
+        f.write_text(f"x = '{RLO}'\n", encoding="utf-8")
+        r = run_cli("scan", "--format", "json", str(f))
+        assert r.returncode == 1
+        doc = json.loads(r.stdout)
+        assert doc["findings"][0]["path"] == str(f)
+
+    def test_scan_json_fail_closed_state_in_document(self, tmp_path: Path):
+        nonutf8 = tmp_path / "evil16.txt"
+        nonutf8.write_bytes(b"\xff\xfe" + f"A{RLO}B".encode("utf-16-le"))
+        r = run_cli("scan", "--format", "json", str(nonutf8))
+        assert r.returncode == 2
+        doc = json.loads(r.stdout)
+        assert len(doc["skipped"]) == 1
+        assert doc["skipped"][0]["path"] == str(nonutf8)
+        assert doc["error"] is None
+        # A missing path is an error, not "clean".
+        r2 = run_cli("scan", "--format", "json", "/definitely/does/not/exist")
+        assert r2.returncode == 2
+        doc2 = json.loads(r2.stdout)
+        assert doc2["error"] is not None
+
+    def test_scan_sarif_findings(self, tmp_path: Path):
+        f = tmp_path / "sample.py"
+        f.write_text(f"x = '{RLO}'\n", encoding="utf-8")
+        r = run_cli("scan", "--format", "sarif", str(f))
+        assert r.returncode == 1
+        doc = json.loads(r.stdout)
+        assert doc["version"] == "2.1.0"
+        run = doc["runs"][0]
+        assert run["tool"]["driver"]["name"] == "boundaryguard"
+        assert len(run["results"]) == 1
+        res = run["results"][0]
+        assert res["ruleId"] == "boundaryguard/bidi_format"
+        assert res["level"] == "error"
+        region = res["locations"][0]["physicalLocation"]["region"]
+        assert region["startLine"] == 1
+        assert region["startColumn"] == 6  # "x = '{" is 5 chars, RLO is the 6th
+
+    def test_scan_sarif_clean(self, tmp_path: Path):
+        f = tmp_path / "clean.py"
+        f.write_text("print('safe')\n", encoding="utf-8")
+        r = run_cli("scan", "--format", "sarif", str(f))
+        assert r.returncode == 0
+        doc = json.loads(r.stdout)
+        assert doc["runs"][0]["results"] == []
+
+    def test_scan_sarif_declares_all_rules(self, tmp_path: Path):
+        f = tmp_path / "clean.py"
+        f.write_text("x = 1\n", encoding="utf-8")
+        r = run_cli("scan", "--format", "sarif", str(f))
+        doc = json.loads(r.stdout)
+        ids = {rule["id"] for rule in doc["runs"][0]["tool"]["driver"]["rules"]}
+        assert ids == {
+            "boundaryguard/bidi_format",
+            "boundaryguard/bidi_mark",
+            "boundaryguard/zero_width",
+            "boundaryguard/control",
+        }
+
+    def test_scan_sarif_uri_percent_encoded(self, tmp_path: Path):
+        # A filename with a space must produce a percent-encoded URI
+        # (mutation M16 guard).
+        f = tmp_path / "has space.py"
+        f.write_text(f"x = '{RLO}'\n", encoding="utf-8")
+        r = run_cli("scan", "--format", "sarif", str(f))
+        assert r.returncode == 1
+        doc = json.loads(r.stdout)
+        uri = doc["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        assert "has%20space.py" in uri
+
+    def test_scan_invalid_format_rejected(self, tmp_path: Path):
+        f = tmp_path / "x.py"
+        f.write_text("x = 1\n", encoding="utf-8")
+        r = run_cli("scan", "--format", "yaml", str(f))
+        assert r.returncode == 2
+
+
+class TestMultiplePaths:
+    """scan/check accept several paths and aggregate their results."""
+
+    def test_scan_multiple_paths(self, tmp_path: Path):
+        a = tmp_path / "a.py"
+        b = tmp_path / "b.py"
+        a.write_text(f"x = '{RLO}'\n", encoding="utf-8")
+        b.write_text(f"y = '{ZWSP}'\n", encoding="utf-8")
+        r = run_cli("scan", str(a), str(b))
+        assert r.returncode == 1
+        assert "a.py" in r.stdout
+        assert "b.py" in r.stdout
+
+    def test_check_multiple_paths_dirty_exit_one(self, tmp_path: Path):
+        a = tmp_path / "a.py"
+        b = tmp_path / "b.py"
+        a.write_text("x = 1\n", encoding="utf-8")
+        b.write_text(f"y = '{RLO}'\n", encoding="utf-8")
+        r = run_cli("check", str(a), str(b))
+        assert r.returncode == 1
+        assert "1 hazard(s)" in r.stdout
+
+    def test_check_multiple_paths_clean_exit_zero(self, tmp_path: Path):
+        a = tmp_path / "a.py"
+        b = tmp_path / "b.py"
+        a.write_text("x = 1\n", encoding="utf-8")
+        b.write_text("y = 2\n", encoding="utf-8")
+        r = run_cli("check", str(a), str(b))
+        assert r.returncode == 0
+
+    def test_check_multiple_paths_fail_closed(self, tmp_path: Path):
+        clean = tmp_path / "a.py"
+        evil16 = tmp_path / "evil16.txt"
+        clean.write_text("x = 1\n", encoding="utf-8")
+        evil16.write_bytes(b"\xff\xfe" + f"A{RLO}B".encode("utf-16-le"))
+        r = run_cli("check", str(clean), str(evil16))
+        assert r.returncode == 2
+        assert "could not be scanned" in r.stderr
+
+    def test_empty_path_among_paths_fails(self, tmp_path: Path):
+        a = tmp_path / "a.py"
+        a.write_text("x = 1\n", encoding="utf-8")
+        r = run_cli("check", str(a), "")
+        assert r.returncode == 2
+        assert "empty path" in r.stderr
+
+
+class TestPreCommitHook:
+    def test_pre_commit_manifest(self):
+        manifest = (REPO_ROOT / ".pre-commit-hooks.yaml").read_text(encoding="utf-8")
+        assert "id: boundaryguard" in manifest
+        assert "entry: boundaryguard check" in manifest
+        assert "language: python" in manifest
+        assert "types: [text]" in manifest
+        assert "pass_filenames: true" in manifest

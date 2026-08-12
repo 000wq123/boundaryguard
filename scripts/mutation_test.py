@@ -75,7 +75,12 @@ ROOT = Path(__file__).resolve().parents[1]
 MUTANT_TIMEOUT = float(os.environ.get("BG_MUTANT_TIMEOUT", "180"))
 
 # Items copied into each sandbox so mutants can never touch the real tree.
-_COPY_ITEMS = ("boundaryguard", "tests", "pyproject.toml")
+_COPY_ITEMS = (
+    "boundaryguard",
+    "tests",
+    "pyproject.toml",
+    ".pre-commit-hooks.yaml",
+)
 _IGNORE = shutil.ignore_patterns(
     "__pycache__", "*.pyc", ".pytest_cache", "*.egg-info", ".coverage"
 )
@@ -304,13 +309,14 @@ MUTANTS: List[Dict[str, object]] = [
         "guard": "empty path must fail loudly, not silently scan the CWD",
         "replacements": [
             (
-                "    if not args.path:\n"
-                '        info["error"] = "empty path"\n'
-                "        return\n",
-                "    pass\n",
+                "        if not path:\n"
+                '            info["error"] = "empty path"\n'
+                "            return\n",
+                "        pass\n",
             ),
         ],
-        "killed_by": "test_check_empty_path_exit_two",
+        "killed_by": "test_check_empty_path_exit_two, "
+        "test_empty_path_among_paths_fails",
     },
     {
         "id": "M15",
@@ -321,6 +327,18 @@ MUTANTS: List[Dict[str, object]] = [
         ],
         "killed_by": "test_alm_is_bidi_control_detected, "
         "test_scan_file_flags_alm, test_preserve_rtl_keeps_alm",
+    },
+    {
+        "id": "M16",
+        "path": "boundaryguard/cli.py",
+        "guard": "SARIF artifact URIs must be percent-encoded (hostile filenames must not corrupt the document)",
+        "replacements": [
+            (
+                "        return Path(path).resolve().as_uri()\n",
+                "        return str(Path(path).resolve())\n",
+            ),
+        ],
+        "killed_by": "test_scan_sarif_uri_percent_encoded",
     },
 ]
 

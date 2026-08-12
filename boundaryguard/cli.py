@@ -21,10 +21,12 @@ a file that cannot be scanned is never silently reported as clean.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import stat
 import sys
 import tempfile
+import urllib.parse
 from pathlib import Path
 from typing import Dict, Iterator, List, Optional
 
@@ -41,6 +43,22 @@ from .core import (
 
 _POLICIES = ("security", "preserve_rtl")
 
+# Machine-readable output formats for `scan`.
+_FORMATS = ("text", "json", "sarif")
+
+_SARIF_SCHEMA = "https://json.schemastore.org/sarif-2.1.0.json"
+
+# One SARIF rule per hazard category, so GitHub Code Scanning and other
+# SARIF consumers can render findings offline (no lookup needed).
+_SARIF_RULES = {
+    "bidi_format": (
+        "Bidirectional formatting controls (Trojan Source, CVE-2021-42574)"
+    ),
+    "bidi_mark": "Invisible bidi marks (ALM/LRM/RLM)",
+    "zero_width": "Zero-width characters (ZWSP/ZWNJ/ZWJ/WJ/BOM)",
+    "control": "C0 control characters (non-whitespace)",
+}
+
 # How many skipped files to list in the warning (count is always shown).
 _MAX_SKIP_DETAIL = 10
 
@@ -51,6 +69,123 @@ _LINE_FORGERY = (0x2028, 0x2029)
 def _render(hazard: Hazard) -> str:
     """Render one hazard as a visible escaped string."""
     return f"\\u{hazard.codepoint:04X}"
+
+
+def _json_dump(obj: object) -> str:
+    """Serialize with ASCII escaping so hostile text cannot break a document."""
+    return json.dumps(obj, ensure_ascii=True)
+
+
+def _file_uri(path: str) -> str:
+    """A percent-encoded ``file://`` URI for *path* (safe for hostile names)."""
+    try:
+        return Path(path).resolve().as_uri()
+    except (OSError, ValueError):
+        return "file://" + urllib.parse.quote(str(Path(path)))
+
+
+def _finding_doc(fmt: str, fh: object) -> str:
+    """Serialize one finding for a machine-readable format."""
+    if fmt == "json":
+        return _json_dump(
+            {
+                "path": fh.path,
+                "line": fh.line,
+                "column": fh.column,
+                "codepoint": fh.hazard.codepoint,
+                "escaped": fh.hazard.escaped,
+                "name": fh.hazard.name,
+                "short": fh.hazard.short,
+                "category": fh.hazard.category,
+            }
+        )
+    return _json_dump(
+        {
+            "ruleId": f"boundaryguard/{fh.hazard.category}",
+            "level": "error",
+            "message": {
+                "text": (
+                    f"{fh.hazard.escaped} {fh.hazard.name} ({fh.hazard.short}) "
+                    f"[{fh.hazard.category}]"
+                )
+            },
+            "locations": [
+                {
+                    "physicalLocation": {
+                        "artifactLocation": {"uri": _file_uri(fh.path)},
+                        "region": {
+                            "startLine": fh.line,
+                            "startColumn": fh.column,
+                        },
+                    }
+                }
+            ],
+        }
+    )
+
+
+def _emit_scan_header(fmt: str, args: argparse.Namespace) -> None:
+    """Emit the opening of a machine-readable scan document (streamed)."""
+    if fmt == "json":
+        print(
+            '{"schemaVersion":"1.0","policy":'
+            + _json_dump(args.policy)
+            + ',"targets":'
+            + _json_dump(args.paths)
+            + ',"findings":[',
+            end="",
+        )
+        return
+    driver = {
+        "name": "boundaryguard",
+        "version": __version__,
+        "informationUri": "https://github.com/000wq123/boundaryguard",
+        "rules": [
+            {
+                "id": f"boundaryguard/{cat}",
+                "name": cat,
+                "shortDescription": {"text": desc},
+                "fullDescription": {"text": desc},
+                "defaultConfiguration": {"level": "error"},
+            }
+            for cat, desc in _SARIF_RULES.items()
+        ],
+    }
+    print(
+        '{"$schema":'
+        + _json_dump(_SARIF_SCHEMA)
+        + ',"version":"2.1.0","runs":[{"tool":{"driver":'
+        + _json_dump(driver)
+        + '},"results":[',
+        end="",
+    )
+
+
+def _emit_scan_footer(fmt: str, info: Dict[str, object]) -> None:
+    """Close the document, carrying fail-closed skip/error state."""
+    skipped = [{"path": p, "reason": r} for p, r in info["skipped"]]
+    error = info.get("error")
+    if fmt == "json":
+        print(
+            '],"skipped":'
+            + _json_dump(skipped)
+            + ',"error":'
+            + _json_dump(error)
+            + "}"
+        )
+        return
+    print(
+        '],"properties":{"skipped":'
+        + _json_dump(skipped)
+        + ',"error":'
+        + _json_dump(error)
+        + "}}]}"
+    )
+
+
+def _targets(args: argparse.Namespace) -> str:
+    """Human-readable list of scan targets."""
+    return ", ".join(args.paths)
 
 
 def _display(text: str) -> str:
@@ -113,20 +248,21 @@ def _stream_scan(args: argparse.Namespace, info: Dict[str, object]) -> Iterator[
         if len(info["skipped"]) < _MAX_SKIP_DETAIL:
             info["skipped"].append((path, reason))
 
-    if not args.path:
-        info["error"] = "empty path"
-        return
-    try:
-        iterator = scan_path_iter(
-            Path(args.path),
-            policy=args.policy,
-            recursive=args.recursive,
-            on_skip=on_skip,
-        )
-        for fh in iterator:
-            yield fh
-    except OSError as exc:
-        info["error"] = str(exc)
+    for path in args.paths:
+        if not path:
+            info["error"] = "empty path"
+            return
+        try:
+            iterator = scan_path_iter(
+                Path(path),
+                policy=args.policy,
+                recursive=args.recursive,
+                on_skip=on_skip,
+            )
+            for fh in iterator:
+                yield fh
+        except OSError as exc:
+            info["error"] = str(exc)
 
 
 def _scan_exit_code(info: Dict[str, object], findings: int) -> int:
@@ -142,9 +278,21 @@ def _scan_exit_code(info: Dict[str, object], findings: int) -> int:
 def cmd_scan(args: argparse.Namespace) -> int:
     info: Dict[str, object] = {"skip_count": 0, "skipped": [], "error": None}
     findings = 0
+    fmt = args.format
+    if fmt != "text":
+        _emit_scan_header(fmt, args)
+    first = True
     for fh in _stream_scan(args, info):
-        _print_hazard_file(fh.path, fh.line, fh.column, fh.hazard)
+        if fmt == "text":
+            _print_hazard_file(fh.path, fh.line, fh.column, fh.hazard)
+        else:
+            if not first:
+                print(",")
+            print(_finding_doc(fmt, fh), end="")
+        first = False
         findings += 1
+    if fmt != "text":
+        _emit_scan_footer(fmt, info)
     if info.get("error"):
         print(f"error: {info['error']}", file=sys.stderr)
         return 2
@@ -158,7 +306,11 @@ def cmd_scan(args: argparse.Namespace) -> int:
     if info["skip_count"]:
         _report_skips(info)
         return 2
-    print(f"OK: no invisible-Unicode hazards found in {args.path} (policy={args.policy}).")
+    if fmt == "text":
+        print(
+            f"OK: no invisible-Unicode hazards found in {_targets(args)} "
+            f"(policy={args.policy})."
+        )
     return 0
 
 
@@ -175,7 +327,7 @@ def cmd_check(args: argparse.Namespace) -> int:
         return 2
     if findings:
         print(
-            f"{findings} hazard(s) found in {args.path} "
+            f"{findings} hazard(s) found in {_targets(args)} "
             f"(policy={args.policy}). First: "
             f"{first.hazard.escaped} {first.hazard.name} "
             f"at {_display(first.path)}:{first.line}:{first.column}"
@@ -184,7 +336,7 @@ def cmd_check(args: argparse.Namespace) -> int:
     if info["skip_count"]:
         _report_skips(info)
         return 2
-    print(f"OK: {args.path} clean (policy={args.policy}).")
+    print(f"OK: {_targets(args)} clean (policy={args.policy}).")
     return 0
 
 
@@ -289,14 +441,20 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version=f"boundaryguard {__version__}")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p_scan = sub.add_parser("scan", help="scan a file or directory (prints file:line:col)")
-    p_scan.add_argument("path", help="file or directory to scan")
+    p_scan = sub.add_parser("scan", help="scan files or directories (prints file:line:col)")
+    p_scan.add_argument("paths", nargs="+", help="file(s) or director(ies) to scan")
     p_scan.add_argument("-r", "--recursive", action="store_true", help="walk directories recursively")
     p_scan.add_argument("--policy", choices=_POLICIES, default="security", help="scan policy")
+    p_scan.add_argument(
+        "--format",
+        choices=_FORMATS,
+        default="text",
+        help="output format: text, json, or sarif (SARIF 2.1.0 for GitHub Code Scanning)",
+    )
     p_scan.set_defaults(func=cmd_scan)
 
     p_check = sub.add_parser("check", help="CI-friendly: exit 0 clean, 1 findings, 2 error")
-    p_check.add_argument("path", help="file or directory to check")
+    p_check.add_argument("paths", nargs="+", help="file(s) or director(ies) to check")
     p_check.add_argument("-r", "--recursive", action="store_true", help="walk directories recursively")
     p_check.add_argument("--policy", choices=_POLICIES, default="security", help="scan policy")
     p_check.set_defaults(func=cmd_check)

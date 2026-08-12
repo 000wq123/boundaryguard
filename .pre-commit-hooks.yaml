@@ -1,0 +1,7 @@
+- id: boundaryguard
+  name: boundaryguard
+  description: Detect and remove invisible Unicode security hazards (Trojan Source / CVE-2021-42574)
+  entry: boundaryguard check
+  language: python
+  types: [text]
+  pass_filenames: true
