@@ -263,6 +263,7 @@ def _stream_scan(args: argparse.Namespace, info: Dict[str, object]) -> Iterator[
                 yield fh
         except OSError as exc:
             info["error"] = str(exc)
+            return  # fail loudly: nothing after the first error is scanned
 
 
 def _scan_exit_code(info: Dict[str, object], findings: int) -> int:
@@ -297,11 +298,12 @@ def cmd_scan(args: argparse.Namespace) -> int:
         print(f"error: {info['error']}", file=sys.stderr)
         return 2
     if findings:
-        print(
-            f"\n{findings} invisible-Unicode hazard(s) found "
-            f"(policy={args.policy}).",
-            file=sys.stderr,
-        )
+        if fmt == "text":
+            print(
+                f"\n{findings} invisible-Unicode hazard(s) found "
+                f"(policy={args.policy}).",
+                file=sys.stderr,
+            )
         return _scan_exit_code(info, findings)
     if info["skip_count"]:
         _report_skips(info)

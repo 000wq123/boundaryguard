@@ -427,6 +427,23 @@ class TestMultiplePaths:
         assert r.returncode == 2
         assert "empty path" in r.stderr
 
+    def test_error_aborts_later_paths(self, tmp_path: Path):
+        # A missing path among several must fail loudly and stop the scan —
+        # later paths must not be scanned (or reported) after an error.
+        missing = tmp_path / "missing.py"
+        later = tmp_path / "later.py"
+        later.write_text(f"x = '{RLO}'\n", encoding="utf-8")
+        r = run_cli("check", str(missing), str(later))
+        assert r.returncode == 2
+        assert "cannot scan" in r.stderr
+        # Text mode must not silently scan-and-drop the later finding;
+        # the error aborts before anything else is examined.
+        r2 = run_cli("scan", "--format", "json", str(missing), str(later))
+        assert r2.returncode == 2
+        doc = json.loads(r2.stdout)
+        assert doc["error"] is not None
+        assert doc["findings"] == []  # nothing after the error was scanned
+
 
 class TestPreCommitHook:
     def test_pre_commit_manifest(self):
